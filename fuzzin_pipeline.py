@@ -1080,9 +1080,12 @@ def build_solid_bmesh(
     edge_face_count,
     depth,
     clearance=0.0,
+    back_trim=0.5,
 ):
     min_x = min(vert_coords[vi].x for vi in selected_verts_set)
-    back_x = min_x - depth
+    # Build deeper than requested, then bisect to get a clean back face.
+    build_depth = depth + back_trim
+    back_x = min_x - build_depth
 
     bm = bmesh.new()
     front_map = {}
@@ -1157,6 +1160,25 @@ def build_solid_bmesh(
             if avg_normal.length > 0:
                 avg_normal.normalize()
             v.co += avg_normal * clearance
+
+    # Bisect at the intended back depth to trim thin geometry and create
+    # a clean, flat back face.
+    cut_x = min_x - depth
+    geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+    result = bmesh.ops.bisect_plane(
+        bm,
+        geom=geom,
+        plane_co=Vector((cut_x, 0.0, 0.0)),
+        plane_no=Vector((1.0, 0.0, 0.0)),
+        clear_outer=False,
+        clear_inner=True,
+    )
+
+    # Fill the open cut boundary to close the back.
+    cut_edges = [e for e in result["geom_cut"] if isinstance(e, bmesh.types.BMEdge)]
+    if cut_edges:
+        bmesh.ops.contextual_create(bm, geom=cut_edges)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
     return bm
 
