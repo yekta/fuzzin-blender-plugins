@@ -667,7 +667,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_depth: FloatProperty(
         name="Connector Depth",
         description="Depth behind the furthest -X point (in scene units)",
-        default=3.0,
+        default=2.0,
         min=0.01,
         soft_max=50.0,
         precision=2,
