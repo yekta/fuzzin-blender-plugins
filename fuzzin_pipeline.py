@@ -700,6 +700,28 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ),
         default=False,
     )
+    mark_offset_y: FloatProperty(
+        name="Y Offset (mm)",
+        description=(
+            "Shift the mark left/right (Y axis) from the "
+            "auto-detected back-face centre"
+        ),
+        default=0.0,
+        soft_min=-10.0,
+        soft_max=10.0,
+        precision=2,
+    )
+    mark_offset_z: FloatProperty(
+        name="Z Offset (mm)",
+        description=(
+            "Shift the mark up/down (Z axis) from the "
+            "auto-detected back-face centre"
+        ),
+        default=0.0,
+        soft_min=-10.0,
+        soft_max=10.0,
+        precision=2,
+    )
     mark_solver: EnumProperty(
         name="Solver",
         description="Boolean solver for the mark cut",
@@ -796,15 +818,15 @@ class CPIPE_OT_restore_scale_points(bpy.types.Operator):
 
 
 # ===========================================================================
-# Connectors for Features - Set / Clear Feature Vertices
+# Connectors for Features - Auto-detect / Set / Clear Feature Vertices
 # ===========================================================================
 
 
 class CPIPE_OT_set_feature_seeds(bpy.types.Operator):
-    """Store the currently selected vertices as feature vertices"""
+    """Auto-detect all feature vertices from the current selection using BFS flood fill"""
 
     bl_idname = "cpipe.set_feature_seeds"
-    bl_label = "Set Feature Vertices"
+    bl_label = "Auto-detect Vertices"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -814,8 +836,10 @@ class CPIPE_OT_set_feature_seeds(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.active_object
+        props = context.scene.cpipe
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
+        bm.normal_update()
 
         seeds = [v for v in bm.verts if v.select]
         if not seeds:
@@ -824,14 +848,33 @@ class CPIPE_OT_set_feature_seeds(bpy.types.Operator):
             )
             return {"CANCELLED"}
 
-        obj["cpipe_feature_seeds"] = [v.index for v in seeds]
+        seed_indices = [v.index for v in seeds]
 
-        props = context.scene.cpipe
-        props.feature_seeds_set = True
-        props.feature_seed_count = len(seeds)
-        props.gradient_threshold = 0.0
+        if props.gradient_threshold < 0.5:
+            optimal, _ = detect_optimal_angle(
+                bm,
+                seed_indices,
+                props.gradient_range_min,
+                props.gradient_range_max,
+            )
+            props.gradient_threshold = optimal
+            self.report({"INFO"}, f"Auto-detected angle: {optimal:.0f} deg")
 
-        self.report({"INFO"}, f"Stored {len(seeds)} feature vertices")
+        grad_limit = math.radians(props.gradient_threshold)
+        selected, boundary = bfs_feature_fill(bm, seed_indices, grad_limit)
+        selected |= boundary
+
+        bpy.ops.mesh.select_all(action="DESELECT")
+        bm.verts.ensure_lookup_table()
+        for idx in selected:
+            bm.verts[idx].select = True
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(obj.data)
+
+        self.report(
+            {"INFO"},
+            f"Auto-detected {len(selected)} verts (boundary: {len(boundary)})",
+        )
         return {"FINISHED"}
 
 
@@ -886,80 +929,41 @@ class CPIPE_OT_restore_feature_seeds(bpy.types.Operator):
 
 
 # ===========================================================================
-# Feature Select (standalone preview with redo)
+# Set Feature Vertices (store current selection)
 # ===========================================================================
 
 
 class CPIPE_OT_feature_select(bpy.types.Operator):
-    """Preview feature selection from stored vertices - adjust angle in redo panel"""
+    """Store the currently selected vertices as feature vertices for the connector"""
 
     bl_idname = "cpipe.feature_select"
-    bl_label = "Preview Features"
+    bl_label = "Set Feature Vertices"
     bl_options = {"REGISTER", "UNDO"}
-
-    gradient_angle: FloatProperty(
-        name="Max Gradient Angle (deg)",
-        description="Maximum normal angle (degrees) between neighbouring vertices",
-        default=0.0,
-        min=0.0,
-        max=90.0,
-        step=100,
-        precision=1,
-    )
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        if not (obj and obj.type == "MESH" and obj.mode == "EDIT"):
-            return False
-        return "cpipe_feature_seeds" in obj
-
-    def invoke(self, context, event):
-        props = context.scene.cpipe
-        if props.gradient_threshold < 0.5:
-            obj = context.active_object
-            seed_indices = list(obj.get("cpipe_feature_seeds", []))
-            if seed_indices:
-                bm = bmesh.from_edit_mesh(obj.data)
-                bm.verts.ensure_lookup_table()
-                bm.normal_update()
-                optimal, _ = detect_optimal_angle(
-                    bm,
-                    seed_indices,
-                    props.gradient_range_min,
-                    props.gradient_range_max,
-                )
-                props.gradient_threshold = optimal
-        self.gradient_angle = props.gradient_threshold
-        return self.execute(context)
+        return obj and obj.type == "MESH" and obj.mode == "EDIT"
 
     def execute(self, context):
         obj = context.active_object
-        seed_indices = list(obj.get("cpipe_feature_seeds", []))
-        if not seed_indices:
-            self.report({"WARNING"}, "No feature vertices stored")
-            return {"CANCELLED"}
-
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
-        bm.normal_update()
 
-        grad_limit = math.radians(self.gradient_angle)
-        context.scene.cpipe.gradient_threshold = self.gradient_angle
+        selected = [v for v in bm.verts if v.select]
+        if not selected:
+            self.report(
+                {"WARNING"}, "Select at least one vertex to set as feature vertices"
+            )
+            return {"CANCELLED"}
 
-        selected, boundary = bfs_feature_fill(bm, seed_indices, grad_limit)
-        selected |= boundary
+        obj["cpipe_feature_seeds"] = [v.index for v in selected]
 
-        bpy.ops.mesh.select_all(action="DESELECT")
-        bm.verts.ensure_lookup_table()
-        for idx in selected:
-            bm.verts[idx].select = True
-        bm.select_flush(True)
-        bmesh.update_edit_mesh(obj.data)
+        props = context.scene.cpipe
+        props.feature_seeds_set = True
+        props.feature_seed_count = len(selected)
 
-        self.report(
-            {"INFO"}, f"Selected {len(selected)} verts (boundary: {len(boundary)})"
-        )
+        self.report({"INFO"}, f"Stored {len(selected)} feature vertices")
         return {"FINISHED"}
 
 
@@ -1049,7 +1053,7 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
 
         # Position: the cutter's X=0 sits at min_x, centred on (cy, cz).
         # The cutter extends in +X so it cuts into the part.
-        mark_obj.location = Vector((min_x, cy, cz))
+        mark_obj.location = Vector((min_x, cy + props.mark_offset_y, cz + props.mark_offset_z))
         context.view_layer.update()
 
         solver = props.mark_solver
@@ -1471,8 +1475,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
         if props.feature_connector_enabled and props.feature_seeds_set:
             bpy.ops.object.mode_set(mode="EDIT")
 
-            seed_indices = list(obj.get("cpipe_feature_seeds", []))
-            if not seed_indices:
+            feature_vert_indices = list(obj.get("cpipe_feature_seeds", []))
+            if not feature_vert_indices:
                 self.report(
                     {"WARNING"}, "No feature vertices stored - skipping connector"
                 )
@@ -1481,25 +1485,14 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 bm.verts.ensure_lookup_table()
                 bm.normal_update()
 
-                if props.gradient_threshold < 0.5:
-                    optimal, _ = detect_optimal_angle(
-                        bm,
-                        seed_indices,
-                        props.gradient_range_min,
-                        props.gradient_range_max,
-                    )
-                    props.gradient_threshold = optimal
-                    self.report({"INFO"}, f"Auto-detected angle: {optimal:.0f} deg")
-
-                grad_limit = math.radians(props.gradient_threshold)
-                selected, boundary = bfs_feature_fill(bm, seed_indices, grad_limit)
-                selected |= boundary
+                feature_verts = set(feature_vert_indices)
 
                 bpy.ops.mesh.select_all(action="DESELECT")
                 bm.verts.ensure_lookup_table()
                 bpy.ops.mesh.select_mode(type="FACE")
-                for idx in selected:
-                    bm.verts[idx].select = True
+                for idx in feature_verts:
+                    if idx < len(bm.verts):
+                        bm.verts[idx].select = True
                 bm.select_flush(True)
                 bmesh.update_edit_mesh(obj.data)
 
@@ -1741,23 +1734,9 @@ class CPIPE_PT_main(bpy.types.Panel):
         row = box.row()
         row.prop(props, "feature_connector_enabled", icon="MOD_SOLIDIFY")
         if props.feature_connector_enabled:
-            if props.feature_seeds_set:
-                box.label(
-                    text=f"{props.feature_seed_count} vertices stored", icon="CHECKMARK"
-                )
-            else:
-                box.label(text="Select vertices, then set", icon="INFO")
-
-            row = box.row(align=True)
-            row.operator("cpipe.set_feature_seeds", icon="EYEDROPPER")
-            row.operator("cpipe.clear_feature_seeds", text="", icon="X")
-
-            row = box.row(align=True)
-            row.enabled = props.prev_feature_seeds_set
-            row.operator("cpipe.restore_feature_seeds", icon="LOOP_BACK")
-
-            box.separator()
-            box.label(text="Max Gradient Angle Range:", icon="VIEWZOOM")
+            # -- Auto-detect section --
+            box.label(text="Auto Mode:", icon="VIEWZOOM")
+            box.label(text="Max Gradient Angle Range:")
             row = box.row(align=True)
             row.prop(props, "gradient_range_min", text="Min")
             row.prop(props, "gradient_range_max", text="Max")
@@ -1766,20 +1745,42 @@ class CPIPE_PT_main(bpy.types.Panel):
             if props.gradient_threshold < 0.5:
                 box.label(text="Will auto-detect when run", icon="INFO")
 
-            box.separator()
-
             col = box.column()
             col.scale_y = 1.2
-            can_select = (
-                obj
-                and obj.type == "MESH"
-                and obj.mode == "EDIT"
-                and props.feature_seeds_set
-            )
-            col.enabled = bool(can_select)
+            can_auto = obj and obj.type == "MESH" and obj.mode == "EDIT"
+            col.enabled = bool(can_auto)
             col.operator(
-                "cpipe.feature_select", text="Preview Features", icon="HIDE_OFF"
+                "cpipe.set_feature_seeds",
+                text="Auto-detect Vertices",
+                icon="EYEDROPPER",
             )
+
+            box.separator()
+
+            # -- Set feature vertices --
+            col = box.column()
+            col.scale_y = 1.2
+            can_set = obj and obj.type == "MESH" and obj.mode == "EDIT"
+            col.enabled = bool(can_set)
+            col.operator(
+                "cpipe.feature_select",
+                text="Set Feature Vertices",
+                icon="CHECKMARK",
+            )
+
+            if props.feature_seeds_set:
+                row = box.row(align=True)
+                row.label(
+                    text=f"{props.feature_seed_count} vertices stored",
+                    icon="CHECKMARK",
+                )
+                row.operator("cpipe.clear_feature_seeds", text="", icon="X")
+
+                row = box.row(align=True)
+                row.enabled = props.prev_feature_seeds_set
+                row.operator("cpipe.restore_feature_seeds", icon="LOOP_BACK")
+            else:
+                box.label(text="No feature vertices set", icon="INFO")
 
             box.separator()
 
@@ -1816,6 +1817,11 @@ class CPIPE_PT_main(bpy.types.Panel):
                         icon="MESH_DATA",
                     )
             box.prop(props, "mark_solver")
+            col = box.column(align=True)
+            col.label(text="Position Offset:")
+            row = col.row(align=True)
+            row.prop(props, "mark_offset_y", text="Y")
+            row.prop(props, "mark_offset_z", text="Z")
             box.separator()
             row = box.row(align=True)
             row.scale_y = 1.4
