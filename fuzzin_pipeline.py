@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 import bmesh
 import math
+import os
 from mathutils import Matrix, Vector
 from collections import deque
 from bpy.props import (
@@ -446,12 +447,12 @@ def _mark_rotation_matrix(direction):
     """
     pi = math.pi
     rotations = {
-        "NEG_X": Matrix.Identity(4),                    # default, no rotation
-        "POS_X": Matrix.Rotation(pi, 4, 'Z'),           # +X → −X
-        "NEG_Y": Matrix.Rotation(pi / 2, 4, 'Z'),       # +X → +Y
-        "POS_Y": Matrix.Rotation(-pi / 2, 4, 'Z'),      # +X → −Y
-        "NEG_Z": Matrix.Rotation(-pi / 2, 4, 'Y'),      # +X → +Z
-        "POS_Z": Matrix.Rotation(pi / 2, 4, 'Y'),       # +X → −Z
+        "NEG_X": Matrix.Identity(4),  # default, no rotation
+        "POS_X": Matrix.Rotation(pi, 4, "Z"),  # +X → −X
+        "NEG_Y": Matrix.Rotation(pi / 2, 4, "Z"),  # +X → +Y
+        "POS_Y": Matrix.Rotation(-pi / 2, 4, "Z"),  # +X → −Y
+        "NEG_Z": Matrix.Rotation(-pi / 2, 4, "Y"),  # +X → +Z
+        "POS_Z": Matrix.Rotation(pi / 2, 4, "Y"),  # +X → −Z
     }
     return rotations.get(direction, Matrix.Identity(4))
 
@@ -781,8 +782,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     mark_offset_z: FloatProperty(
         name="Z Offset (mm)",
         description=(
-            "Shift the mark up/down (Z axis) from the "
-            "auto-detected back-face centre"
+            "Shift the mark up/down (Z axis) from the " "auto-detected back-face centre"
         ),
         default=0.0,
         soft_min=-10.0,
@@ -811,6 +811,42 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             ("FLOAT", "Float", "Fast, works for simple shapes"),
         ],
         default="EXACT",
+    )
+
+    # --- Export ---
+    export_enabled: BoolProperty(
+        name="Export STLs",
+        description="Export all visible objects as individual STL files",
+        default=False,
+    )
+    export_hidden: BoolProperty(
+        name="Export Hidden",
+        description="Include hidden objects in the export",
+        default=False,
+    )
+    export_forward_axis: EnumProperty(
+        name="Forward",
+        items=[
+            ("X", "X", ""),
+            ("Y", "Y", ""),
+            ("Z", "Z", ""),
+            ("NEGATIVE_X", "-X", ""),
+            ("NEGATIVE_Y", "-Y", ""),
+            ("NEGATIVE_Z", "-Z", ""),
+        ],
+        default="X",
+    )
+    export_up_axis: EnumProperty(
+        name="Up",
+        items=[
+            ("X", "X", ""),
+            ("Y", "Y", ""),
+            ("Z", "Z", ""),
+            ("NEGATIVE_X", "-X", ""),
+            ("NEGATIVE_Y", "-Y", ""),
+            ("NEGATIVE_Z", "-Z", ""),
+        ],
+        default="Z",
     )
 
 
@@ -1138,7 +1174,9 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
         context.collection.objects.link(mark_obj)
 
         # Position: place cutter at face centre with user offsets.
-        mark_obj.location = face_centre + Vector((0, props.mark_offset_y, props.mark_offset_z))
+        mark_obj.location = face_centre + Vector(
+            (0, props.mark_offset_y, props.mark_offset_z)
+        )
         context.view_layer.update()
 
         solver = props.mark_solver
@@ -1416,6 +1454,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
     bl_label = "Run Pipeline"
     bl_options = {"REGISTER", "UNDO"}
 
+    directory: bpy.props.StringProperty(subtype="DIR_PATH")
+
     @classmethod
     def poll(cls, context):
         obj = context.active_object
@@ -1427,7 +1467,18 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
             or props.flatten_bottom_enabled
             or props.bottom_connector_enabled
             or (props.feature_connector_enabled and props.feature_seeds_set)
+            or props.export_enabled
         )
+
+    def invoke(self, context, event):
+        props = context.scene.cpipe
+        if props.export_enabled:
+            # Default to the blend file's directory
+            if bpy.data.filepath:
+                self.directory = os.path.dirname(bpy.data.filepath)
+            context.window_manager.fileselect_add(self)
+            return {"RUNNING_MODAL"}
+        return self.execute(context)
 
     def execute(self, context):
         obj = context.active_object
@@ -1436,6 +1487,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
         did_flatten = False
         did_bottom_conn = False
         did_connector = False
+        did_export = False
+        export_count = 0
         flatten_info = ""
 
         original_mode = obj.mode
@@ -1771,6 +1824,62 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 f"{props.connector_clearance:.2f} mm clearance"
             )
 
+        # ================================================================
+        # STEP — EXPORT STLs
+        # ================================================================
+
+        if props.export_enabled:
+            blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+            if not blend_name:
+                self.report({"ERROR"}, "Save the .blend file first before exporting")
+                return {"CANCELLED"}
+
+            dash_idx = blend_name.find("-")
+            prefix = (blend_name[:dash_idx] if dash_idx > 0 else blend_name).capitalize()
+
+            export_dir = self.directory
+
+            # Remember current selection state
+            prev_active = context.view_layer.objects.active
+            prev_selected = [o for o in context.scene.objects if o.select_get()]
+
+            for export_obj in context.scene.objects:
+                if export_obj.type != "MESH":
+                    continue
+                if not props.export_hidden:
+                    if export_obj.hide_viewport or export_obj.hide_get():
+                        continue
+
+                bpy.ops.object.select_all(action="DESELECT")
+                export_obj.select_set(True)
+                context.view_layer.objects.active = export_obj
+
+                part_name = export_obj.name.capitalize()
+                filename = f"{prefix} - {part_name}.stl"
+                filepath = os.path.join(export_dir, filename)
+
+                bpy.ops.wm.stl_export(
+                    filepath=filepath,
+                    export_selected_objects=True,
+                    apply_modifiers=True,
+                    ascii_format=False,
+                    forward_axis=props.export_forward_axis,
+                    up_axis=props.export_up_axis,
+                )
+                export_count += 1
+
+            # Restore selection state
+            bpy.ops.object.select_all(action="DESELECT")
+            for o in prev_selected:
+                o.select_set(True)
+            if prev_active:
+                context.view_layer.objects.active = prev_active
+
+            did_export = True
+
+        if did_export:
+            parts.append(f"Exported {export_count} STL(s)")
+
         if parts:
             self.report({"INFO"}, "Pipeline complete! " + " | ".join(parts))
         else:
@@ -1951,6 +2060,16 @@ class CPIPE_PT_main(bpy.types.Panel):
             op_r = row.operator("cpipe.mark_side", text="Mark Right", icon="TRIA_RIGHT")
             op_r.side = "RIGHT"
 
+        # ---- Export STLs ----
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "export_enabled", icon="EXPORT")
+        if props.export_enabled:
+            col = box.column(align=True)
+            col.prop(props, "export_hidden")
+            col.prop(props, "export_forward_axis")
+            col.prop(props, "export_up_axis")
+
         # ---- Run Pipeline ----
         layout.separator()
         col = layout.column()
@@ -1964,6 +2083,7 @@ class CPIPE_PT_main(bpy.types.Panel):
                 or props.flatten_bottom_enabled
                 or props.bottom_connector_enabled
                 or (props.feature_connector_enabled and props.feature_seeds_set)
+                or props.export_enabled
             )
         )
 
