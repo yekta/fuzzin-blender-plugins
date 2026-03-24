@@ -666,7 +666,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
 
     connector_depth: FloatProperty(
         name="Connector Depth",
-        description="Depth behind the furthest -X point (in scene units)",
+        description="Depth behind the furthest point along the chosen direction (in scene units)",
         default=2.0,
         min=0.01,
         soft_max=50.0,
@@ -679,6 +679,19 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         min=0.0,
         soft_max=2.0,
         precision=2,
+    )
+    connector_direction: EnumProperty(
+        name="Direction",
+        description="Direction to extrude the feature connector",
+        items=[
+            ("NEG_X", "-X", "Negative X direction"),
+            ("POS_X", "+X", "Positive X direction"),
+            ("NEG_Y", "-Y", "Negative Y direction"),
+            ("POS_Y", "+Y", "Positive Y direction"),
+            ("NEG_Z", "-Z", "Negative Z direction"),
+            ("POS_Z", "+Z", "Positive Z direction"),
+        ],
+        default="NEG_X",
     )
     connector_solver: EnumProperty(
         name="Solver",
@@ -1077,6 +1090,19 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
 # ===========================================================================
 
 
+def _parse_direction(direction):
+    """Return (axis_index, sign) for a direction enum value."""
+    axis_map = {
+        "NEG_X": (0, -1),
+        "POS_X": (0, 1),
+        "NEG_Y": (1, -1),
+        "POS_Y": (1, 1),
+        "NEG_Z": (2, -1),
+        "POS_Z": (2, 1),
+    }
+    return axis_map.get(direction, axis_map["NEG_X"])
+
+
 def build_solid_bmesh(
     face_vert_lists,
     vert_coords,
@@ -1085,11 +1111,20 @@ def build_solid_bmesh(
     depth,
     clearance=0.0,
     back_trim=0.5,
+    direction="NEG_X",
 ):
-    min_x = min(vert_coords[vi].x for vi in selected_verts_set)
+    axis_idx, sign = _parse_direction(direction)
+
+    # Find the extremum along the extrusion axis
+    axis_vals = [vert_coords[vi][axis_idx] for vi in selected_verts_set]
+    if sign < 0:
+        extremum = min(axis_vals)
+    else:
+        extremum = max(axis_vals)
+
     # Build deeper than requested, then bisect to get a clean back face.
     build_depth = depth + back_trim
-    back_x = min_x - build_depth
+    back_val = extremum + sign * build_depth
 
     bm = bmesh.new()
     front_map = {}
@@ -1099,7 +1134,8 @@ def build_solid_bmesh(
         co = vert_coords[vi]
         front_v = bm.verts.new(co)
         front_map[vi] = front_v
-        back_co = Vector((back_x, co.y, co.z))
+        back_co = co.copy()
+        back_co[axis_idx] = back_val
         back_v = bm.verts.new(back_co)
         back_map[vi] = back_v
 
@@ -1167,13 +1203,17 @@ def build_solid_bmesh(
 
     # Bisect at the intended back depth to trim thin geometry and create
     # a clean, flat back face.
-    cut_x = min_x - depth
+    cut_val = extremum + sign * depth
+    plane_co = Vector((0.0, 0.0, 0.0))
+    plane_co[axis_idx] = cut_val
+    plane_no = Vector((0.0, 0.0, 0.0))
+    plane_no[axis_idx] = -sign  # normal points inward (toward the feature)
     geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
     result = bmesh.ops.bisect_plane(
         bm,
         geom=geom,
-        plane_co=Vector((cut_x, 0.0, 0.0)),
-        plane_no=Vector((1.0, 0.0, 0.0)),
+        plane_co=plane_co,
+        plane_no=plane_no,
         clear_outer=False,
         clear_inner=True,
     )
@@ -1540,12 +1580,15 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                 bpy.ops.object.mode_set(mode="OBJECT")
 
+                direction = props.connector_direction
+
                 conn_bm = build_solid_bmesh(
                     face_vert_lists,
                     vert_coords,
                     selected_verts_set,
                     edge_face_count,
                     depth,
+                    direction=direction,
                 )
                 conn_mesh = bpy.data.meshes.new("Connector")
                 conn_bm.to_mesh(conn_mesh)
@@ -1562,6 +1605,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     edge_face_count,
                     depth,
                     clearance=clearance,
+                    direction=direction,
                 )
                 cutter_mesh = bpy.data.meshes.new("_Cutter")
                 cutter_bm.to_mesh(cutter_mesh)
@@ -1650,7 +1694,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
             )
         if did_connector:
             parts.append(
-                f"Feature connector: {props.connector_depth:.1f} mm depth, "
+                f"Feature connector: {props.connector_depth:.1f} mm depth "
+                f"({props.connector_direction}), "
                 f"{props.connector_clearance:.2f} mm clearance"
             )
 
@@ -1785,6 +1830,7 @@ class CPIPE_PT_main(bpy.types.Panel):
             box.separator()
 
             col = box.column(align=True)
+            col.prop(props, "connector_direction")
             col.prop(props, "connector_depth")
             col.prop(props, "connector_clearance")
             col.prop(props, "connector_solver")
