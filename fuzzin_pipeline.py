@@ -11,7 +11,7 @@ bl_info = {
 import bpy
 import bmesh
 import math
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from collections import deque
 from bpy.props import (
     FloatProperty,
@@ -439,6 +439,23 @@ def create_tmark_cutter_bm(side="LEFT"):
     return bm
 
 
+def _mark_rotation_matrix(direction):
+    """Return a 4×4 rotation matrix that transforms the default cutter
+    orientation (profile on YZ, extending +X) to cut inward from the
+    face specified by *direction*.
+    """
+    pi = math.pi
+    rotations = {
+        "NEG_X": Matrix.Identity(4),                    # default, no rotation
+        "POS_X": Matrix.Rotation(pi, 4, 'Z'),           # +X → −X
+        "NEG_Y": Matrix.Rotation(pi / 2, 4, 'Z'),       # +X → +Y
+        "POS_Y": Matrix.Rotation(-pi / 2, 4, 'Z'),      # +X → −Y
+        "NEG_Z": Matrix.Rotation(-pi / 2, 4, 'Y'),      # +X → +Z
+        "POS_Z": Matrix.Rotation(pi / 2, 4, 'Y'),       # +X → −Z
+    }
+    return rotations.get(direction, Matrix.Identity(4))
+
+
 def _find_mesh_islands(obj):
     """Detect disconnected mesh islands inside *obj* using BFS on edges.
 
@@ -507,6 +524,43 @@ def _island_back_face_centre(obj, vert_indices):
     centre_z = sum(v.z for v in back) / len(back)
 
     return min_x, centre_y, centre_z
+
+
+def _island_face_centre(obj, vert_indices, direction="NEG_X"):
+    """Find the placement point for the mark on the face determined by *direction*.
+
+    Collects all vertices near the extremum along the chosen axis (within a
+    tolerance) and averages the remaining two axes.
+
+    Returns a Vector(x, y, z) in world space.
+    """
+    axis_idx, sign = _parse_direction(direction)
+    me = obj.data
+    world = obj.matrix_world
+
+    coords = [world @ me.vertices[vi].co for vi in vert_indices]
+    if not coords:
+        return Vector((0, 0, 0))
+
+    axis_vals = [c[axis_idx] for c in coords]
+    if sign < 0:
+        extremum = min(axis_vals)
+    else:
+        extremum = max(axis_vals)
+
+    # Gather verts near the face plane
+    tol = 0.2  # mm
+    face_verts = [c for c in coords if abs(c[axis_idx] - extremum) <= tol]
+
+    other_axes = [i for i in range(3) if i != axis_idx]
+    c1 = sum(v[other_axes[0]] for v in face_verts) / len(face_verts)
+    c2 = sum(v[other_axes[1]] for v in face_verts) / len(face_verts)
+
+    result = [0.0, 0.0, 0.0]
+    result[axis_idx] = extremum
+    result[other_axes[0]] = c1
+    result[other_axes[1]] = c2
+    return Vector(result)
 
 
 def _island_centroid(obj, vert_indices):
@@ -734,6 +788,19 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_min=-10.0,
         soft_max=10.0,
         precision=2,
+    )
+    mark_direction: EnumProperty(
+        name="Direction",
+        description="Face direction to engrave the mark on",
+        items=[
+            ("NEG_X", "-X", "Negative X face (back)"),
+            ("POS_X", "+X", "Positive X face (front)"),
+            ("NEG_Y", "-Y", "Negative Y face"),
+            ("POS_Y", "+Y", "Positive Y face"),
+            ("NEG_Z", "-Z", "Negative Z face (bottom)"),
+            ("POS_Z", "+Z", "Positive Z face (top)"),
+        ],
+        default="NEG_X",
     )
     mark_solver: EnumProperty(
         name="Solver",
@@ -1051,11 +1118,17 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
                 f"({len(target_island)} verts)",
             )
 
-        # ---- Find back-face centre of the chosen island ----
-        min_x, cy, cz = _island_back_face_centre(obj, target_island)
+        # ---- Find face centre of the chosen island ----
+        direction = props.mark_direction
+        face_centre = _island_face_centre(obj, target_island, direction)
 
         # ---- Build the T-mark cutter ----
         mark_bm = create_tmark_cutter_bm(side=self.side)
+
+        # Rotate the cutter from default orientation (profile on YZ,
+        # extending +X) to match the chosen direction.
+        rot = _mark_rotation_matrix(direction)
+        bmesh.ops.transform(mark_bm, matrix=rot, verts=mark_bm.verts[:])
 
         mark_mesh = bpy.data.meshes.new("_TMarkCutter")
         mark_bm.to_mesh(mark_mesh)
@@ -1064,9 +1137,8 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
         mark_obj = bpy.data.objects.new("_TMarkCutter", mark_mesh)
         context.collection.objects.link(mark_obj)
 
-        # Position: the cutter's X=0 sits at min_x, centred on (cy, cz).
-        # The cutter extends in +X so it cuts into the part.
-        mark_obj.location = Vector((min_x, cy + props.mark_offset_y, cz + props.mark_offset_z))
+        # Position: place cutter at face centre with user offsets.
+        mark_obj.location = face_centre + Vector((0, props.mark_offset_y, props.mark_offset_z))
         context.view_layer.update()
 
         solver = props.mark_solver
@@ -1862,6 +1934,7 @@ class CPIPE_PT_main(bpy.types.Panel):
                         text="Single body",
                         icon="MESH_DATA",
                     )
+            box.prop(props, "mark_direction")
             box.prop(props, "mark_solver")
             col = box.column(align=True)
             col.label(text="Position Offset:")
