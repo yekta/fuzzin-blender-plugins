@@ -447,12 +447,28 @@ def _mark_rotation_matrix(direction):
     """
     pi = math.pi
     rotations = {
-        "NEG_X": Matrix.Identity(4),  # default, no rotation
-        "POS_X": Matrix.Rotation(pi, 4, "Z"),  # +X → −X
-        "NEG_Y": Matrix.Rotation(pi / 2, 4, "Z"),  # +X → +Y
-        "POS_Y": Matrix.Rotation(-pi / 2, 4, "Z"),  # +X → −Y
-        "NEG_Z": Matrix.Rotation(-pi / 2, 4, "Y"),  # +X → +Z
-        "POS_Z": Matrix.Rotation(pi / 2, 4, "Y"),  # +X → −Z
+        # Axis-aligned: rotate +X to point inward (= -direction_vec)
+        "NEG_X": Matrix.Identity(4),                    # +X → +X (inward from -X face)
+        "POS_X": Matrix.Rotation(pi, 4, "Z"),           # +X → -X
+        "NEG_Y": Matrix.Rotation(pi / 2, 4, "Z"),       # +X → +Y
+        "POS_Y": Matrix.Rotation(-pi / 2, 4, "Z"),      # +X → -Y
+        "NEG_Z": Matrix.Rotation(-pi / 2, 4, "Y"),      # +X → +Z
+        "POS_Z": Matrix.Rotation(pi / 2, 4, "Y"),       # +X → -Z
+        # XY diagonals: rotate around Z
+        "NEG_X_NEG_Y": Matrix.Rotation(pi / 4, 4, "Z"),        # +X → (+X+Y)/√2
+        "NEG_X_POS_Y": Matrix.Rotation(-pi / 4, 4, "Z"),       # +X → (+X-Y)/√2
+        "POS_X_NEG_Y": Matrix.Rotation(3 * pi / 4, 4, "Z"),    # +X → (-X+Y)/√2
+        "POS_X_POS_Y": Matrix.Rotation(-3 * pi / 4, 4, "Z"),   # +X → (-X-Y)/√2
+        # XZ diagonals: rotate around Y
+        "NEG_X_NEG_Z": Matrix.Rotation(-pi / 4, 4, "Y"),       # +X → (+X+Z)/√2
+        "NEG_X_POS_Z": Matrix.Rotation(pi / 4, 4, "Y"),        # +X → (+X-Z)/√2
+        "POS_X_NEG_Z": Matrix.Rotation(-3 * pi / 4, 4, "Y"),   # +X → (-X+Z)/√2
+        "POS_X_POS_Z": Matrix.Rotation(3 * pi / 4, 4, "Y"),    # +X → (-X-Z)/√2
+        # YZ diagonals: first rotate to ±Y axis, then tilt ±45° around X
+        "NEG_Y_NEG_Z": Matrix.Rotation(pi / 4, 4, "X") @ Matrix.Rotation(pi / 2, 4, "Z"),
+        "NEG_Y_POS_Z": Matrix.Rotation(-pi / 4, 4, "X") @ Matrix.Rotation(pi / 2, 4, "Z"),
+        "POS_Y_NEG_Z": Matrix.Rotation(-pi / 4, 4, "X") @ Matrix.Rotation(-pi / 2, 4, "Z"),
+        "POS_Y_POS_Z": Matrix.Rotation(pi / 4, 4, "X") @ Matrix.Rotation(-pi / 2, 4, "Z"),
     }
     return rotations.get(direction, Matrix.Identity(4))
 
@@ -530,12 +546,11 @@ def _island_back_face_centre(obj, vert_indices):
 def _island_face_centre(obj, vert_indices, direction="NEG_X"):
     """Find the placement point for the mark on the face determined by *direction*.
 
-    Collects all vertices near the extremum along the chosen axis (within a
-    tolerance) and averages the remaining two axes.
-
-    Returns a Vector(x, y, z) in world space.
+    Projects all vertices onto the direction vector, finds the outermost
+    vertices (within a tolerance), and returns their centroid in world space.
+    Works for both axis-aligned and diagonal directions.
     """
-    axis_idx, sign = _parse_direction(direction)
+    dir_vec = _parse_direction(direction)
     me = obj.data
     world = obj.matrix_world
 
@@ -543,25 +558,19 @@ def _island_face_centre(obj, vert_indices, direction="NEG_X"):
     if not coords:
         return Vector((0, 0, 0))
 
-    axis_vals = [c[axis_idx] for c in coords]
-    if sign < 0:
-        extremum = min(axis_vals)
-    else:
-        extremum = max(axis_vals)
+    projs = [dir_vec.dot(c) for c in coords]
+    extremum_proj = max(projs)
 
-    # Gather verts near the face plane
+    # Gather verts near the outermost face plane
     tol = 0.2  # mm
-    face_verts = [c for c in coords if abs(c[axis_idx] - extremum) <= tol]
+    face_verts = [c for c, p in zip(coords, projs) if abs(p - extremum_proj) <= tol]
+    if not face_verts:
+        face_verts = coords
 
-    other_axes = [i for i in range(3) if i != axis_idx]
-    c1 = sum(v[other_axes[0]] for v in face_verts) / len(face_verts)
-    c2 = sum(v[other_axes[1]] for v in face_verts) / len(face_verts)
-
-    result = [0.0, 0.0, 0.0]
-    result[axis_idx] = extremum
-    result[other_axes[0]] = c1
-    result[other_axes[1]] = c2
-    return Vector(result)
+    cx = sum(v.x for v in face_verts) / len(face_verts)
+    cy = sum(v.y for v in face_verts) / len(face_verts)
+    cz = sum(v.z for v in face_verts) / len(face_verts)
+    return Vector((cx, cy, cz))
 
 
 def _island_centroid(obj, vert_indices):
@@ -745,6 +754,18 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             ("POS_Y", "+Y", "Positive Y direction"),
             ("NEG_Z", "-Z", "Negative Z direction"),
             ("POS_Z", "+Z", "Positive Z direction"),
+            ("NEG_X_NEG_Y", "-X/-Y", "45° diagonal: Negative X & Negative Y"),
+            ("NEG_X_POS_Y", "-X/+Y", "45° diagonal: Negative X & Positive Y"),
+            ("POS_X_NEG_Y", "+X/-Y", "45° diagonal: Positive X & Negative Y"),
+            ("POS_X_POS_Y", "+X/+Y", "45° diagonal: Positive X & Positive Y"),
+            ("NEG_X_NEG_Z", "-X/-Z", "45° diagonal: Negative X & Negative Z"),
+            ("NEG_X_POS_Z", "-X/+Z", "45° diagonal: Negative X & Positive Z"),
+            ("POS_X_NEG_Z", "+X/-Z", "45° diagonal: Positive X & Negative Z"),
+            ("POS_X_POS_Z", "+X/+Z", "45° diagonal: Positive X & Positive Z"),
+            ("NEG_Y_NEG_Z", "-Y/-Z", "45° diagonal: Negative Y & Negative Z"),
+            ("NEG_Y_POS_Z", "-Y/+Z", "45° diagonal: Negative Y & Positive Z"),
+            ("POS_Y_NEG_Z", "+Y/-Z", "45° diagonal: Positive Y & Negative Z"),
+            ("POS_Y_POS_Z", "+Y/+Z", "45° diagonal: Positive Y & Positive Z"),
         ],
         default="NEG_X",
     )
@@ -799,6 +820,18 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             ("POS_Y", "+Y", "Positive Y face"),
             ("NEG_Z", "-Z", "Negative Z face (bottom)"),
             ("POS_Z", "+Z", "Positive Z face (top)"),
+            ("NEG_X_NEG_Y", "-X/-Y", "45° diagonal face: Negative X & Negative Y"),
+            ("NEG_X_POS_Y", "-X/+Y", "45° diagonal face: Negative X & Positive Y"),
+            ("POS_X_NEG_Y", "+X/-Y", "45° diagonal face: Positive X & Negative Y"),
+            ("POS_X_POS_Y", "+X/+Y", "45° diagonal face: Positive X & Positive Y"),
+            ("NEG_X_NEG_Z", "-X/-Z", "45° diagonal face: Negative X & Negative Z"),
+            ("NEG_X_POS_Z", "-X/+Z", "45° diagonal face: Negative X & Positive Z"),
+            ("POS_X_NEG_Z", "+X/-Z", "45° diagonal face: Positive X & Negative Z"),
+            ("POS_X_POS_Z", "+X/+Z", "45° diagonal face: Positive X & Positive Z"),
+            ("NEG_Y_NEG_Z", "-Y/-Z", "45° diagonal face: Negative Y & Negative Z"),
+            ("NEG_Y_POS_Z", "-Y/+Z", "45° diagonal face: Negative Y & Positive Z"),
+            ("POS_Y_NEG_Z", "+Y/-Z", "45° diagonal face: Positive Y & Negative Z"),
+            ("POS_Y_POS_Z", "+Y/+Z", "45° diagonal face: Positive Y & Positive Z"),
         ],
         default="NEG_X",
     )
@@ -1201,16 +1234,29 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
 
 
 def _parse_direction(direction):
-    """Return (axis_index, sign) for a direction enum value."""
-    axis_map = {
-        "NEG_X": (0, -1),
-        "POS_X": (0, 1),
-        "NEG_Y": (1, -1),
-        "POS_Y": (1, 1),
-        "NEG_Z": (2, -1),
-        "POS_Z": (2, 1),
+    """Return a normalised direction Vector for a direction enum value."""
+    s = 1.0 / math.sqrt(2)
+    direction_map = {
+        "NEG_X": Vector((-1, 0, 0)),
+        "POS_X": Vector((1, 0, 0)),
+        "NEG_Y": Vector((0, -1, 0)),
+        "POS_Y": Vector((0, 1, 0)),
+        "NEG_Z": Vector((0, 0, -1)),
+        "POS_Z": Vector((0, 0, 1)),
+        "NEG_X_NEG_Y": Vector((-s, -s, 0)),
+        "NEG_X_POS_Y": Vector((-s, s, 0)),
+        "POS_X_NEG_Y": Vector((s, -s, 0)),
+        "POS_X_POS_Y": Vector((s, s, 0)),
+        "NEG_X_NEG_Z": Vector((-s, 0, -s)),
+        "NEG_X_POS_Z": Vector((-s, 0, s)),
+        "POS_X_NEG_Z": Vector((s, 0, -s)),
+        "POS_X_POS_Z": Vector((s, 0, s)),
+        "NEG_Y_NEG_Z": Vector((0, -s, -s)),
+        "NEG_Y_POS_Z": Vector((0, -s, s)),
+        "POS_Y_NEG_Z": Vector((0, s, -s)),
+        "POS_Y_POS_Z": Vector((0, s, s)),
     }
-    return axis_map.get(direction, axis_map["NEG_X"])
+    return direction_map.get(direction, Vector((-1, 0, 0)))
 
 
 def build_solid_bmesh(
@@ -1223,18 +1269,15 @@ def build_solid_bmesh(
     back_trim=0.5,
     direction="NEG_X",
 ):
-    axis_idx, sign = _parse_direction(direction)
+    dir_vec = _parse_direction(direction)
 
-    # Find the extremum along the extrusion axis
-    axis_vals = [vert_coords[vi][axis_idx] for vi in selected_verts_set]
-    if sign < 0:
-        extremum = min(axis_vals)
-    else:
-        extremum = max(axis_vals)
+    # Find the extremum projection along the extrusion direction.
+    projs = [dir_vec.dot(vert_coords[vi]) for vi in selected_verts_set]
+    extremum_proj = max(projs)
 
     # Build deeper than requested, then bisect to get a clean back face.
     build_depth = depth + back_trim
-    back_val = extremum + sign * build_depth
+    back_proj = extremum_proj + build_depth
 
     bm = bmesh.new()
     front_map = {}
@@ -1244,9 +1287,9 @@ def build_solid_bmesh(
         co = vert_coords[vi]
         front_v = bm.verts.new(co)
         front_map[vi] = front_v
-        back_co = co.copy()
-        back_co[axis_idx] = back_val
-        back_v = bm.verts.new(back_co)
+        # Move co along dir_vec until its projection equals back_proj.
+        offset = back_proj - dir_vec.dot(co)
+        back_v = bm.verts.new(co + dir_vec * offset)
         back_map[vi] = back_v
 
     bm.verts.ensure_lookup_table()
@@ -1313,11 +1356,9 @@ def build_solid_bmesh(
 
     # Bisect at the intended back depth to trim thin geometry and create
     # a clean, flat back face.
-    cut_val = extremum + sign * depth
-    plane_co = Vector((0.0, 0.0, 0.0))
-    plane_co[axis_idx] = cut_val
-    plane_no = Vector((0.0, 0.0, 0.0))
-    plane_no[axis_idx] = -sign  # normal points inward (toward the feature)
+    cut_proj = extremum_proj + depth
+    plane_co = dir_vec * cut_proj
+    plane_no = -dir_vec  # points inward (toward the feature)
     geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
     result = bmesh.ops.bisect_plane(
         bm,
