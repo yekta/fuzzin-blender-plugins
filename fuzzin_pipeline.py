@@ -789,21 +789,22 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ),
         default=False,
     )
-    mark_offset_y: FloatProperty(
-        name="Y Offset (mm)",
+    mark_offset_x: FloatProperty(
+        name="X Offset (mm)",
         description=(
-            "Shift the mark left/right (Y axis) from the "
-            "auto-detected back-face centre"
+            "Shift the mark along the local X+ of the chosen face (toward "
+            "the right side of the L, where its foot extends)"
         ),
         default=0.0,
         soft_min=-10.0,
         soft_max=10.0,
         precision=2,
     )
-    mark_offset_z: FloatProperty(
-        name="Z Offset (mm)",
+    mark_offset_y: FloatProperty(
+        name="Y Offset (mm)",
         description=(
-            "Shift the mark up/down (Z axis) from the " "auto-detected back-face centre"
+            "Shift the mark along the local Y+ of the chosen face (toward "
+            "the top of the L)"
         ),
         default=0.0,
         soft_min=-10.0,
@@ -1206,9 +1207,18 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
         mark_obj = bpy.data.objects.new("_TMarkCutter", mark_mesh)
         context.collection.objects.link(mark_obj)
 
-        # Position: place cutter at face centre with user offsets.
-        mark_obj.location = face_centre + Vector(
-            (0, props.mark_offset_y, props.mark_offset_z)
+        # Offsets are expressed in the face's local frame, where X+ points
+        # toward the right of the L (where its foot extends) and Y+ points
+        # toward the top of the L.  The cutter profile is built on the
+        # YZ plane with the L's foot extending toward -Y_profile and the
+        # stem rising toward +Z_profile, so the local axes in world space
+        # are just those two unit vectors rotated by the same matrix that
+        # aligns the cutter with the chosen direction.
+        rot3 = rot.to_3x3()
+        local_x_dir = rot3 @ Vector((0, -1, 0))
+        local_y_dir = rot3 @ Vector((0, 0, 1))
+        mark_obj.location = face_centre + (
+            local_x_dir * props.mark_offset_x + local_y_dir * props.mark_offset_y
         )
         context.view_layer.update()
 
@@ -2089,8 +2099,8 @@ class CPIPE_PT_main(bpy.types.Panel):
             col = box.column(align=True)
             col.label(text="Position Offset:")
             row = col.row(align=True)
+            row.prop(props, "mark_offset_x", text="X")
             row.prop(props, "mark_offset_y", text="Y")
-            row.prop(props, "mark_offset_z", text="Z")
             box.separator()
             row = box.row(align=True)
             row.scale_y = 1.4
