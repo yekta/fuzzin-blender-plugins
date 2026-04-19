@@ -935,6 +935,7 @@ class CPIPE_OT_clear_scale_points(bpy.types.Operator):
 
     bl_idname = "cpipe.clear_scale_points"
     bl_label = "Clear Scale Vertices"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         props = context.scene.cpipe
@@ -949,6 +950,7 @@ class CPIPE_OT_restore_scale_points(bpy.types.Operator):
 
     bl_idname = "cpipe.restore_scale_points"
     bl_label = "Restore Previous Vertices"
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
@@ -1033,6 +1035,7 @@ class CPIPE_OT_clear_feature_seeds(bpy.types.Operator):
 
     bl_idname = "cpipe.clear_feature_seeds"
     bl_label = "Clear Feature Vertices"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         obj = context.active_object
@@ -1051,6 +1054,7 @@ class CPIPE_OT_restore_feature_seeds(bpy.types.Operator):
 
     bl_idname = "cpipe.restore_feature_seeds"
     bl_label = "Restore Previous Vertices"
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
