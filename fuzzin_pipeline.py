@@ -1886,7 +1886,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 return {"CANCELLED"}
 
             dash_idx = blend_name.find("-")
-            prefix = (blend_name[:dash_idx] if dash_idx > 0 else blend_name).capitalize()
+            raw_prefix = blend_name[:dash_idx] if dash_idx > 0 else blend_name
+            prefix = raw_prefix.rstrip("0123456789").capitalize()
 
             export_dir = self.directory
 
@@ -1905,7 +1906,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 export_obj.select_set(True)
                 context.view_layer.objects.active = export_obj
 
-                part_name = export_obj.name.capitalize()
+                part_name = export_obj.name.title()
                 filename = f"{prefix} - {part_name}.stl"
                 filepath = os.path.join(export_dir, filename)
 
