@@ -748,6 +748,22 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=2.0,
         precision=2,
     )
+    connector_neg_dir_clearance: BoolProperty(
+        name="Negative Direction Clearance",
+        description=(
+            "Also extend the cutter opposite the extrusion direction, "
+            "continuing the draft angle if present"
+        ),
+        default=False,
+    )
+    connector_neg_dir_clearance_value: FloatProperty(
+        name="Neg Dir Clearance",
+        description="Amount to extend the cutter opposite the extrusion direction",
+        default=0.2,
+        min=0.0,
+        soft_max=2.0,
+        precision=2,
+    )
     connector_draft_enabled: BoolProperty(
         name="Draft",
         description=(
@@ -1346,6 +1362,7 @@ def build_solid_bmesh(
     back_trim=0.5,
     direction="NEG_X",
     draft_angle_rad=0.0,
+    forward_clearance=0.0,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -1357,13 +1374,64 @@ def build_solid_bmesh(
     build_depth = depth + back_trim
     back_proj = extremum_proj + build_depth
 
+    # Negative direction clearance: shift the front face opposite the extrusion
+    # direction and, when drafted, widen it so the wall slope continues.
+    forward_shift = -dir_vec * forward_clearance if forward_clearance > 1e-6 else Vector((0, 0, 0))
+    forward_expand = (
+        forward_clearance * math.tan(draft_angle_rad)
+        if forward_clearance > 1e-6 and draft_angle_rad > 1e-6
+        else 0.0
+    )
+    if forward_expand > 0.0:
+        ref = Vector((0, 0, 1)) if abs(dir_vec.z) < 0.9 else Vector((1, 0, 0))
+        fu_axis = dir_vec.cross(ref).normalized()
+        fv_axis = dir_vec.cross(fu_axis).normalized()
+
+        # Area-weighted centroid of the feature projected onto (fu, fv).
+        total_area = 0.0
+        wx = 0.0
+        wy = 0.0
+        for fvl in face_vert_lists:
+            if len(fvl) < 3:
+                continue
+            pts = [
+                (fu_axis.dot(vert_coords[vi]), fv_axis.dot(vert_coords[vi]))
+                for vi in fvl
+            ]
+            p0x, p0y = pts[0]
+            for i in range(1, len(pts) - 1):
+                p1x, p1y = pts[i]
+                p2x, p2y = pts[i + 1]
+                tri_area = 0.5 * ((p1x - p0x) * (p2y - p0y) - (p1y - p0y) * (p2x - p0x))
+                cx = (p0x + p1x + p2x) / 3.0
+                cy = (p0y + p1y + p2y) / 3.0
+                total_area += tri_area
+                wx += tri_area * cx
+                wy += tri_area * cy
+
+        if abs(total_area) < 1e-12:
+            forward_expand = 0.0
+        else:
+            fcu = wx / total_area
+            fcv = wy / total_area
+
     bm = bmesh.new()
     front_map = {}
     back_map = {}
 
     for vi in selected_verts_set:
         co = vert_coords[vi]
-        front_v = bm.verts.new(co)
+        front_co = co + forward_shift
+        if forward_expand > 0.0:
+            vu = fu_axis.dot(co)
+            vv = fv_axis.dot(co)
+            du = vu - fcu
+            dv = vv - fcv
+            dist = math.sqrt(du * du + dv * dv)
+            if dist > 1e-5:
+                factor = forward_expand / dist
+                front_co = front_co + fu_axis * (du * factor) + fv_axis * (dv * factor)
+        front_v = bm.verts.new(front_co)
         front_map[vi] = front_v
         # Move co along dir_vec until its projection equals back_proj.
         offset = back_proj - dir_vec.dot(co)
@@ -2041,6 +2109,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     clearance=clearance,
                     direction=direction,
                     draft_angle_rad=draft_rad,
+                    forward_clearance=(
+                        props.connector_neg_dir_clearance_value
+                        if props.connector_neg_dir_clearance
+                        else 0.0
+                    ),
                 )
                 cutter_mesh = bpy.data.meshes.new("_Cutter")
                 cutter_bm.to_mesh(cutter_mesh)
@@ -2168,10 +2241,16 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 if props.connector_draft_enabled
                 else ""
             )
+            neg_dir_str = (
+                f" +{props.connector_neg_dir_clearance_value:.2f} mm neg-dir"
+                if props.connector_neg_dir_clearance
+                else ""
+            )
             parts.append(
                 f"Feature connector: {props.connector_depth:.1f} mm depth "
                 f"({props.connector_direction}), "
                 f"{props.connector_clearance:.2f} mm clearance"
+                f"{neg_dir_str}"
                 f"{draft_str}"
             )
         if did_boolean:
@@ -2371,6 +2450,10 @@ class CPIPE_PT_main(bpy.types.Panel):
             col.prop(props, "connector_direction")
             col.prop(props, "connector_depth")
             col.prop(props, "connector_clearance")
+            col.prop(props, "connector_neg_dir_clearance")
+            sub = col.row()
+            sub.enabled = props.connector_neg_dir_clearance
+            sub.prop(props, "connector_neg_dir_clearance_value")
             col.prop(props, "connector_draft_enabled")
             sub = col.row()
             sub.enabled = props.connector_draft_enabled
