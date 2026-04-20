@@ -550,27 +550,55 @@ def _island_back_face_centre(obj, vert_indices):
 def _island_face_centre(obj, vert_indices, direction="NEG_X"):
     """Find the placement point for the mark on the face determined by *direction*.
 
-    Projects all vertices onto the direction vector, finds the outermost
-    vertices (within a tolerance), and returns their centroid in world space.
-    Works for both axis-aligned and diagonal directions.
+    Looks for the flat plane perpendicular to *direction* that sits farthest
+    along it: collect polygons whose outward normal is aligned with *dir_vec*
+    (within ~15°), then pick the coplanar group whose centers share the
+    maximum projection along *dir_vec*, and return their area-weighted
+    centroid in world space.
+
+    Falls back to the vertex-extremum method when no aligned faces exist
+    (e.g. the island is fully curved or beveled).
     """
     dir_vec = _parse_direction(direction)
     me = obj.data
     world = obj.matrix_world
+    # Inverse-transpose handles non-uniform scale when rotating normals.
+    normal_mat = world.to_3x3().inverted().transposed()
 
+    vert_set = set(vert_indices)
+    align_threshold = math.cos(math.radians(15.0))
+
+    aligned = []  # (world_center, proj_along_dir, area)
+    for poly in me.polygons:
+        if not all(vi in vert_set for vi in poly.vertices):
+            continue
+        nrm = (normal_mat @ poly.normal).normalized()
+        if nrm.dot(dir_vec) < align_threshold:
+            continue
+        center = world @ poly.center
+        aligned.append((center, dir_vec.dot(center), poly.area))
+
+    if aligned:
+        extremum = max(p for _, p, _ in aligned)
+        plane_tol = 0.1  # mm — group of coplanar faces at the extremum
+        group = [(c, a) for c, p, a in aligned if abs(p - extremum) <= plane_tol]
+        total_area = sum(a for _, a in group)
+        if total_area > 0.0:
+            cx = sum(c.x * a for c, a in group) / total_area
+            cy = sum(c.y * a for c, a in group) / total_area
+            cz = sum(c.z * a for c, a in group) / total_area
+            return Vector((cx, cy, cz))
+
+    # Fallback: no face aligned with the requested direction.
     coords = [world @ me.vertices[vi].co for vi in vert_indices]
     if not coords:
         return Vector((0, 0, 0))
-
     projs = [dir_vec.dot(c) for c in coords]
     extremum_proj = max(projs)
-
-    # Gather verts near the outermost face plane
     tol = 0.2  # mm
     face_verts = [c for c, p in zip(coords, projs) if abs(p - extremum_proj) <= tol]
     if not face_verts:
         face_verts = coords
-
     cx = sum(v.x for v in face_verts) / len(face_verts)
     cy = sum(v.y for v in face_verts) / len(face_verts)
     cz = sum(v.z for v in face_verts) / len(face_verts)
@@ -940,7 +968,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             ("MANIFOLD", "Manifold", "Good for complex geometry"),
             ("FLOAT", "Float", "Fast, works for simple shapes"),
         ],
-        default="EXACT",
+        default="MANIFOLD",
     )
 
     # --- Export ---
@@ -1427,9 +1455,7 @@ def build_boundary_loops(edge_face_count):
     return loops
 
 
-def smooth_boundary_loops(
-    loops, vert_coords, dir_vec, iterations=8, factor=0.5
-):
+def smooth_boundary_loops(loops, vert_coords, dir_vec, iterations=8, factor=0.5):
     """Laplacian-relax boundary-loop vertices in the plane perpendicular to
     *dir_vec*.
 
@@ -1518,7 +1544,9 @@ def build_solid_bmesh(
 
     # Negative direction clearance: shift the front face opposite the extrusion
     # direction and, when drafted, widen it so the wall slope continues.
-    forward_shift = -dir_vec * forward_clearance if forward_clearance > 1e-6 else Vector((0, 0, 0))
+    forward_shift = (
+        -dir_vec * forward_clearance if forward_clearance > 1e-6 else Vector((0, 0, 0))
+    )
     forward_expand = (
         forward_clearance * math.tan(draft_angle_rad)
         if forward_clearance > 1e-6 and draft_angle_rad > 1e-6
@@ -1939,7 +1967,9 @@ def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=
 # ===========================================================================
 
 
-def perform_boolean_subtract(context, tool_obj, target_obj, clearance, solver, report_fn=None):
+def perform_boolean_subtract(
+    context, tool_obj, target_obj, clearance, solver, report_fn=None
+):
     """Subtract a YZ-plane offset of *tool_obj* from *target_obj*.
 
     Returns True on success, False on failure.  Both input objects are kept;
@@ -1995,7 +2025,12 @@ class CPIPE_OT_boolean(bpy.types.Operator):
             return {"CANCELLED"}
 
         ok = perform_boolean_subtract(
-            context, tool, target, props.boolean_clearance, props.boolean_solver, self.report
+            context,
+            tool,
+            target,
+            props.boolean_clearance,
+            props.boolean_solver,
+            self.report,
         )
         if not ok:
             self.report({"WARNING"}, "Boolean failed. Try a different solver.")
