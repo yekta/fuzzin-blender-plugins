@@ -782,6 +782,23 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         step=100,
         precision=1,
     )
+    connector_smooth_enabled: BoolProperty(
+        name="Boundary Smoothing",
+        description=(
+            "Laplacian-smooth the feature boundary loop (in the plane "
+            "perpendicular to the extrusion direction) before building the "
+            "connector. Removes jagged tessellation edges and keeps the "
+            "connector and slot cutter perfectly matched"
+        ),
+        default=False,
+    )
+    connector_smooth_iterations: IntProperty(
+        name="Smoothing Iterations",
+        description="Number of Laplacian smoothing passes on the boundary loop",
+        default=8,
+        min=1,
+        max=50,
+    )
     connector_direction: EnumProperty(
         name="Direction",
         description="Direction to extrude the feature connector",
@@ -1352,6 +1369,130 @@ def _parse_direction(direction):
     return direction_map.get(direction, Vector((-1, 0, 0)))
 
 
+def _planar_basis(dir_vec):
+    """Return (u_axis, v_axis): an orthonormal basis for the plane perpendicular
+    to *dir_vec*.
+    """
+    ref = Vector((0, 0, 1)) if abs(dir_vec.z) < 0.9 else Vector((1, 0, 0))
+    u_axis = dir_vec.cross(ref).normalized()
+    v_axis = dir_vec.cross(u_axis).normalized()
+    return u_axis, v_axis
+
+
+def build_boundary_loops(edge_face_count):
+    """Given ``edge_face_count`` (keys: sorted ``(vi1, vi2)`` tuples, values:
+    list of face indices touching that edge), walk every edge that belongs to
+    exactly one face (a feature-boundary edge) and return ordered vertex loops.
+
+    Each returned loop is a list of vertex indices in cyclic order.  Open
+    chains (rare — would indicate non-manifold selection) are included as-is
+    without wrapping.
+    """
+    adj = {}
+    for (vi1, vi2), face_list in edge_face_count.items():
+        if len(face_list) != 1:
+            continue
+        adj.setdefault(vi1, []).append(vi2)
+        adj.setdefault(vi2, []).append(vi1)
+
+    loops = []
+    visited = set()
+    for start in adj:
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        prev = None
+        cur = start
+        while True:
+            nxts = [n for n in adj[cur] if n != prev]
+            if not nxts:
+                break
+            nxt = None
+            for cand in nxts:
+                if cand == start:
+                    nxt = cand
+                    break
+                if cand not in visited:
+                    nxt = cand
+                    break
+            if nxt is None or nxt == start:
+                break
+            loop.append(nxt)
+            visited.add(nxt)
+            prev = cur
+            cur = nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def smooth_boundary_loops(
+    loops, vert_coords, dir_vec, iterations=8, factor=0.5
+):
+    """Laplacian-relax boundary-loop vertices in the plane perpendicular to
+    *dir_vec*.
+
+    Only the in-plane component of each Laplacian step is applied — the axial
+    component is preserved so verts stay on the feature surface.  Modifies
+    *vert_coords* in place.  Interior feature verts are left untouched.
+    """
+    if iterations <= 0:
+        return
+    for _ in range(iterations):
+        updates = {}
+        for loop in loops:
+            n = len(loop)
+            if n < 3:
+                continue
+            for i, vi in enumerate(loop):
+                prev_co = vert_coords[loop[(i - 1) % n]]
+                next_co = vert_coords[loop[(i + 1) % n]]
+                co = vert_coords[vi]
+                delta = (prev_co + next_co) * 0.5 - co
+                axial = dir_vec * dir_vec.dot(delta)
+                in_plane = delta - axial
+                updates[vi] = co + in_plane * factor
+        for vi, new_co in updates.items():
+            vert_coords[vi] = new_co
+
+
+def boundary_2d_outward_normals(loops, vert_coords, dir_vec):
+    """For each vertex of every boundary loop, compute the 2D outward unit
+    normal in the plane perpendicular to *dir_vec*.
+
+    The tangent at each vertex is (next − prev) projected into the plane; the
+    normal is obtained by rotating the tangent 90° about *dir_vec*.  The sign
+    is chosen so the normal points away from the loop's 2D centroid.
+
+    Returns ``dict[int, Vector]`` keyed by vertex index.
+    """
+    u_axis, v_axis = _planar_basis(dir_vec)
+    normals = {}
+    for loop in loops:
+        n = len(loop)
+        if n < 3:
+            continue
+        # 2D centroid for outward disambiguation.
+        cu = sum(u_axis.dot(vert_coords[vi]) for vi in loop) / n
+        cv = sum(v_axis.dot(vert_coords[vi]) for vi in loop) / n
+        for i, vi in enumerate(loop):
+            prev_co = vert_coords[loop[(i - 1) % n]]
+            next_co = vert_coords[loop[(i + 1) % n]]
+            tang = next_co - prev_co
+            tang = tang - dir_vec * dir_vec.dot(tang)
+            nrm = dir_vec.cross(tang)
+            if nrm.length < 1e-9:
+                continue
+            nrm.normalize()
+            cu_off = u_axis.dot(vert_coords[vi]) - cu
+            cv_off = v_axis.dot(vert_coords[vi]) - cv
+            if u_axis.dot(nrm) * cu_off + v_axis.dot(nrm) * cv_off < 0:
+                nrm = -nrm
+            normals[vi] = nrm
+    return normals
+
+
 def build_solid_bmesh(
     face_vert_lists,
     vert_coords,
@@ -1363,6 +1504,7 @@ def build_solid_bmesh(
     direction="NEG_X",
     draft_angle_rad=0.0,
     forward_clearance=0.0,
+    boundary_2d_normals=None,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -1568,17 +1710,77 @@ def build_solid_bmesh(
     if clearance > 0.0:
         bm.faces.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
-        for f in bm.faces:
-            f.normal_update()
+        bm.edges.ensure_lookup_table()
+
+        # Compute 2D outward normals on the fly if caller didn't supply them.
+        if boundary_2d_normals is None:
+            loops = build_boundary_loops(edge_face_count)
+            boundary_2d_normals = boundary_2d_outward_normals(
+                loops, vert_coords, dir_vec
+            )
+
+        # Front-cap verts survive bisect; back-cap verts at cut_proj were
+        # created by bisect + contextual_create.
+        front_vert_to_vi = {fv: vi for vi, fv in front_map.items()}
+        proj_eps = 1e-4
+        back_vert_set = set()
         for v in bm.verts:
-            if not v.link_faces:
+            if v in front_vert_to_vi:
                 continue
-            avg_normal = Vector((0, 0, 0))
-            for f in v.link_faces:
-                avg_normal += f.normal
-            if avg_normal.length > 0:
-                avg_normal.normalize()
-            v.co += avg_normal * clearance
+            if abs(dir_vec.dot(v.co) - cut_proj) < proj_eps:
+                back_vert_set.add(v)
+
+        u_axis, v_axis = _planar_basis(dir_vec)
+
+        # 2D centroid of the back cap, used to orient outward normals along
+        # the back loop even after draft has moved verts inward.
+        if back_vert_set:
+            back_cu = sum(u_axis.dot(v.co) for v in back_vert_set) / len(back_vert_set)
+            back_cv = sum(v_axis.dot(v.co) for v in back_vert_set) / len(back_vert_set)
+        else:
+            back_cu = back_cv = 0.0
+
+        # Adjacency along the back loop (only edges that stay on cut_proj).
+        back_adj = {v: [] for v in back_vert_set}
+        for v in back_vert_set:
+            for e in v.link_edges:
+                other = e.other_vert(v)
+                if other in back_vert_set:
+                    back_adj[v].append(other)
+
+        new_positions = {}
+
+        # Front-cap verts: push forward (−dir_vec) so the cutter pokes out of
+        # the model surface for a clean boolean.  Perimeter verts also move
+        # outward in the plane by the clean 2D normal.
+        for vi, fv in front_map.items():
+            delta = -dir_vec * clearance
+            n2d = boundary_2d_normals.get(vi)
+            if n2d is not None:
+                delta = delta + n2d * clearance
+            new_positions[fv] = fv.co + delta
+
+        # Back-cap verts: deeper axially and outward planar (all are on the
+        # perimeter).  Planar direction is derived from two loop neighbours
+        # on the back cap, disambiguated against the back-cap centroid.
+        for v in back_vert_set:
+            delta = dir_vec * clearance
+            nbrs = back_adj.get(v, [])
+            if len(nbrs) >= 2:
+                tang = nbrs[1].co - nbrs[0].co
+                tang = tang - dir_vec * dir_vec.dot(tang)
+                nrm3d = dir_vec.cross(tang)
+                if nrm3d.length > 1e-9:
+                    nrm3d.normalize()
+                    off_u = u_axis.dot(v.co) - back_cu
+                    off_v = v_axis.dot(v.co) - back_cv
+                    if u_axis.dot(nrm3d) * off_u + v_axis.dot(nrm3d) * off_v < 0:
+                        nrm3d = -nrm3d
+                    delta = delta + nrm3d * clearance
+            new_positions[v] = v.co + delta
+
+        for v, new_co in new_positions.items():
+            v.co = new_co
 
     return bm
 
@@ -2083,6 +2285,23 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     else 0.0
                 )
 
+                # Smooth the feature boundary loop in-plane so the connector
+                # and cutter share a clean, non-jagged perimeter.  2D outward
+                # normals (re)computed from the smoothed coords feed the
+                # planar-offset clearance step inside build_solid_bmesh.
+                dir_vec = _parse_direction(direction)
+                boundary_loops = build_boundary_loops(edge_face_count)
+                if props.connector_smooth_enabled:
+                    smooth_boundary_loops(
+                        boundary_loops,
+                        vert_coords,
+                        dir_vec,
+                        iterations=props.connector_smooth_iterations,
+                    )
+                boundary_normals = boundary_2d_outward_normals(
+                    boundary_loops, vert_coords, dir_vec
+                )
+
                 conn_bm = build_solid_bmesh(
                     face_vert_lists,
                     vert_coords,
@@ -2091,6 +2310,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     depth,
                     direction=direction,
                     draft_angle_rad=draft_rad,
+                    boundary_2d_normals=boundary_normals,
                 )
                 conn_mesh = bpy.data.meshes.new("Connector")
                 conn_bm.to_mesh(conn_mesh)
@@ -2114,6 +2334,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         if props.connector_neg_dir_clearance
                         else 0.0
                     ),
+                    boundary_2d_normals=boundary_normals,
                 )
                 cutter_mesh = bpy.data.meshes.new("_Cutter")
                 cutter_bm.to_mesh(cutter_mesh)
@@ -2458,6 +2679,10 @@ class CPIPE_PT_main(bpy.types.Panel):
             sub = col.row()
             sub.enabled = props.connector_draft_enabled
             sub.prop(props, "connector_draft_angle")
+            col.prop(props, "connector_smooth_enabled")
+            sub = col.row()
+            sub.enabled = props.connector_smooth_enabled
+            sub.prop(props, "connector_smooth_iterations")
             col.prop(props, "connector_solver")
 
         # ---- Boolean ----
