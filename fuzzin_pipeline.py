@@ -802,6 +802,47 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         default="MANIFOLD",
     )
 
+    # --- Boolean (clearance subtract) ---
+    boolean_enabled: BoolProperty(
+        name="Boolean",
+        description=(
+            "Subtract a clearance-offset copy of the tool body from the target "
+            "body. The offset grows in world +X and the YZ plane but never in "
+            "-X, so the back face stays put. Both bodies are kept"
+        ),
+        default=False,
+    )
+    boolean_tool: bpy.props.PointerProperty(
+        name="Tool",
+        description="Body whose offset shape is subtracted from the target",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == "MESH",
+    )
+    boolean_target: bpy.props.PointerProperty(
+        name="Target",
+        description="Body that the offset tool shape is subtracted from",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == "MESH",
+    )
+    boolean_clearance: FloatProperty(
+        name="Clearance (mm)",
+        description="Outward offset applied to the tool before subtraction",
+        default=0.2,
+        min=0.0,
+        soft_max=2.0,
+        precision=3,
+    )
+    boolean_solver: EnumProperty(
+        name="Solver",
+        description="Boolean solver for the clearance subtraction",
+        items=[
+            ("EXACT", "Exact", "Slower but most accurate (recommended)"),
+            ("MANIFOLD", "Manifold", "Good for complex geometry"),
+            ("FLOAT", "Float", "Fast, works for simple shapes"),
+        ],
+        default="EXACT",
+    )
+
     # --- Mark Left / Right ---
     mark_left_right_enabled: BoolProperty(
         name="Mark Left & Right",
@@ -1475,6 +1516,50 @@ def build_solid_bmesh(
 
 
 # ===========================================================================
+# YZ-Plane Offset Cutter (Boolean step)
+# ===========================================================================
+
+
+def build_yz_offset_cutter_bm(tool_obj, clearance):
+    """Build a bmesh that is *tool_obj* baked into world space, then expanded
+    outward by *clearance* along each vertex's averaged face normal — but with
+    the normal's X component clamped to be non-negative first.
+
+    The clamp means faces pointing in +X grow in +X, faces pointing in YZ grow
+    in YZ, and faces pointing in -X don't move at all.  In practice the back
+    (-X) face of the tool stays put while every other surface inflates.
+
+    Returned bmesh is in world coordinates; the cutter object should sit at
+    the origin (identity matrix_world) when used for the boolean.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(tool_obj.data)
+
+    world = tool_obj.matrix_world
+    for v in bm.verts:
+        v.co = world @ v.co
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+
+    if clearance > 0.0:
+        for f in bm.faces:
+            f.normal_update()
+        for v in bm.verts:
+            if not v.link_faces:
+                continue
+            avg_normal = Vector((0, 0, 0))
+            for f in v.link_faces:
+                avg_normal += f.normal
+            if avg_normal.x < 0.0:
+                avg_normal.x = 0.0
+            if avg_normal.length > 0:
+                avg_normal.normalize()
+                v.co += avg_normal * clearance
+
+    return bm
+
+
+# ===========================================================================
 # Centre of Gravity (Volume Centroid)
 # ===========================================================================
 
@@ -1580,6 +1665,80 @@ def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=
 
 
 # ===========================================================================
+# Boolean (clearance subtract)
+# ===========================================================================
+
+
+def perform_boolean_subtract(context, tool_obj, target_obj, clearance, solver, report_fn=None):
+    """Subtract a YZ-plane offset of *tool_obj* from *target_obj*.
+
+    Returns True on success, False on failure.  Both input objects are kept;
+    only the temporary cutter mesh is removed.
+    """
+    if target_obj.mode != "OBJECT":
+        bpy.ops.object.select_all(action="DESELECT")
+        target_obj.select_set(True)
+        context.view_layer.objects.active = target_obj
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    cutter_bm = build_yz_offset_cutter_bm(tool_obj, clearance)
+    cutter_mesh = bpy.data.meshes.new("_BooleanCutter")
+    cutter_bm.to_mesh(cutter_mesh)
+    cutter_bm.free()
+
+    cutter_obj = bpy.data.objects.new("_BooleanCutter", cutter_mesh)
+    context.collection.objects.link(cutter_obj)
+    context.view_layer.update()
+
+    return apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn)
+
+
+class CPIPE_OT_boolean(bpy.types.Operator):
+    """Subtract a clearance-offset copy of the tool body from the target body"""
+
+    bl_idname = "cpipe.boolean"
+    bl_label = "Run Boolean"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.cpipe
+        return (
+            props.boolean_tool is not None
+            and props.boolean_target is not None
+            and props.boolean_tool != props.boolean_target
+        )
+
+    def execute(self, context):
+        props = context.scene.cpipe
+        tool = props.boolean_tool
+        target = props.boolean_target
+
+        if tool is None or target is None:
+            self.report({"WARNING"}, "Pick both a tool and a target body")
+            return {"CANCELLED"}
+        if tool == target:
+            self.report({"WARNING"}, "Tool and target must be different objects")
+            return {"CANCELLED"}
+        if tool.type != "MESH" or target.type != "MESH":
+            self.report({"WARNING"}, "Tool and target must be mesh objects")
+            return {"CANCELLED"}
+
+        ok = perform_boolean_subtract(
+            context, tool, target, props.boolean_clearance, props.boolean_solver, self.report
+        )
+        if not ok:
+            self.report({"WARNING"}, "Boolean failed. Try a different solver.")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Subtracted {tool.name} (offset {props.boolean_clearance:.3f} mm) from {target.name}",
+        )
+        return {"FINISHED"}
+
+
+# ===========================================================================
 # Run Pipeline
 # ===========================================================================
 
@@ -1604,6 +1763,12 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
             or props.flatten_bottom_enabled
             or props.bottom_connector_enabled
             or (props.feature_connector_enabled and props.feature_seeds_set)
+            or (
+                props.boolean_enabled
+                and props.boolean_tool is not None
+                and props.boolean_target is not None
+                and props.boolean_tool != props.boolean_target
+            )
             or props.export_enabled
         )
 
@@ -1624,6 +1789,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
         did_flatten = False
         did_bottom_conn = False
         did_connector = False
+        did_boolean = False
         did_export = False
         export_count = 0
         flatten_info = ""
@@ -1929,6 +2095,41 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 props.gradient_threshold = 0.0
 
         # ================================================================
+        # STEP 5 — BOOLEAN (clearance subtract)
+        # ================================================================
+
+        if (
+            props.boolean_enabled
+            and props.boolean_tool is not None
+            and props.boolean_target is not None
+            and props.boolean_tool != props.boolean_target
+            and props.boolean_tool.type == "MESH"
+            and props.boolean_target.type == "MESH"
+        ):
+            if obj.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+            ok = perform_boolean_subtract(
+                context,
+                props.boolean_tool,
+                props.boolean_target,
+                props.boolean_clearance,
+                props.boolean_solver,
+                self.report,
+            )
+            if ok:
+                did_boolean = True
+            else:
+                self.report(
+                    {"WARNING"},
+                    "Boolean step failed. Try a different solver.",
+                )
+
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+        # ================================================================
         # Restore mode
         # ================================================================
 
@@ -1972,6 +2173,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 f"({props.connector_direction}), "
                 f"{props.connector_clearance:.2f} mm clearance"
                 f"{draft_str}"
+            )
+        if did_boolean:
+            parts.append(
+                f"Boolean: {props.boolean_tool.name} - {props.boolean_clearance:.3f} mm "
+                f"-> {props.boolean_target.name}"
             )
 
         # ================================================================
@@ -2171,6 +2377,23 @@ class CPIPE_PT_main(bpy.types.Panel):
             sub.prop(props, "connector_draft_angle")
             col.prop(props, "connector_solver")
 
+        # ---- Boolean ----
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "boolean_enabled", icon="MOD_BOOLEAN")
+        if props.boolean_enabled:
+            col = box.column(align=True)
+            col.prop(props, "boolean_tool")
+            col.prop(props, "boolean_target")
+            if (
+                props.boolean_tool is not None
+                and props.boolean_target is not None
+                and props.boolean_tool == props.boolean_target
+            ):
+                box.label(text="Tool and target must differ", icon="ERROR")
+            box.prop(props, "boolean_clearance")
+            box.prop(props, "boolean_solver")
+
         # ---- Mark Left / Right ----
         box = layout.box()
         row = box.row()
@@ -2238,6 +2461,12 @@ class CPIPE_PT_main(bpy.types.Panel):
                 or props.flatten_bottom_enabled
                 or props.bottom_connector_enabled
                 or (props.feature_connector_enabled and props.feature_seeds_set)
+                or (
+                    props.boolean_enabled
+                    and props.boolean_tool is not None
+                    and props.boolean_target is not None
+                    and props.boolean_tool != props.boolean_target
+                )
                 or props.export_enabled
             )
         )
@@ -2263,6 +2492,7 @@ classes = (
     CPIPE_OT_restore_feature_seeds,
     CPIPE_OT_feature_select,
     CPIPE_OT_mark_side,
+    CPIPE_OT_boolean,
     CPIPE_OT_run_pipeline,
     CPIPE_PT_main,
 )
