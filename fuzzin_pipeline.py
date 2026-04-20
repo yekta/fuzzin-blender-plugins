@@ -448,27 +448,31 @@ def _mark_rotation_matrix(direction):
     pi = math.pi
     rotations = {
         # Axis-aligned: rotate +X to point inward (= -direction_vec)
-        "NEG_X": Matrix.Identity(4),                    # +X → +X (inward from -X face)
-        "POS_X": Matrix.Rotation(pi, 4, "Z"),           # +X → -X
-        "NEG_Y": Matrix.Rotation(pi / 2, 4, "Z"),       # +X → +Y
-        "POS_Y": Matrix.Rotation(-pi / 2, 4, "Z"),      # +X → -Y
-        "NEG_Z": Matrix.Rotation(-pi / 2, 4, "Y"),      # +X → +Z
-        "POS_Z": Matrix.Rotation(pi / 2, 4, "Y"),       # +X → -Z
+        "NEG_X": Matrix.Identity(4),  # +X → +X (inward from -X face)
+        "POS_X": Matrix.Rotation(pi, 4, "Z"),  # +X → -X
+        "NEG_Y": Matrix.Rotation(pi / 2, 4, "Z"),  # +X → +Y
+        "POS_Y": Matrix.Rotation(-pi / 2, 4, "Z"),  # +X → -Y
+        "NEG_Z": Matrix.Rotation(-pi / 2, 4, "Y"),  # +X → +Z
+        "POS_Z": Matrix.Rotation(pi / 2, 4, "Y"),  # +X → -Z
         # XY diagonals: rotate around Z
-        "NEG_X_NEG_Y": Matrix.Rotation(pi / 4, 4, "Z"),        # +X → (+X+Y)/√2
-        "NEG_X_POS_Y": Matrix.Rotation(-pi / 4, 4, "Z"),       # +X → (+X-Y)/√2
-        "POS_X_NEG_Y": Matrix.Rotation(3 * pi / 4, 4, "Z"),    # +X → (-X+Y)/√2
-        "POS_X_POS_Y": Matrix.Rotation(-3 * pi / 4, 4, "Z"),   # +X → (-X-Y)/√2
+        "NEG_X_NEG_Y": Matrix.Rotation(pi / 4, 4, "Z"),  # +X → (+X+Y)/√2
+        "NEG_X_POS_Y": Matrix.Rotation(-pi / 4, 4, "Z"),  # +X → (+X-Y)/√2
+        "POS_X_NEG_Y": Matrix.Rotation(3 * pi / 4, 4, "Z"),  # +X → (-X+Y)/√2
+        "POS_X_POS_Y": Matrix.Rotation(-3 * pi / 4, 4, "Z"),  # +X → (-X-Y)/√2
         # XZ diagonals: rotate around Y
-        "NEG_X_NEG_Z": Matrix.Rotation(-pi / 4, 4, "Y"),       # +X → (+X+Z)/√2
-        "NEG_X_POS_Z": Matrix.Rotation(pi / 4, 4, "Y"),        # +X → (+X-Z)/√2
-        "POS_X_NEG_Z": Matrix.Rotation(-3 * pi / 4, 4, "Y"),   # +X → (-X+Z)/√2
-        "POS_X_POS_Z": Matrix.Rotation(3 * pi / 4, 4, "Y"),    # +X → (-X-Z)/√2
+        "NEG_X_NEG_Z": Matrix.Rotation(-pi / 4, 4, "Y"),  # +X → (+X+Z)/√2
+        "NEG_X_POS_Z": Matrix.Rotation(pi / 4, 4, "Y"),  # +X → (+X-Z)/√2
+        "POS_X_NEG_Z": Matrix.Rotation(-3 * pi / 4, 4, "Y"),  # +X → (-X+Z)/√2
+        "POS_X_POS_Z": Matrix.Rotation(3 * pi / 4, 4, "Y"),  # +X → (-X-Z)/√2
         # YZ diagonals: first rotate to ±Y axis, then tilt ±45° around X
-        "NEG_Y_NEG_Z": Matrix.Rotation(pi / 4, 4, "X") @ Matrix.Rotation(pi / 2, 4, "Z"),
-        "NEG_Y_POS_Z": Matrix.Rotation(-pi / 4, 4, "X") @ Matrix.Rotation(pi / 2, 4, "Z"),
-        "POS_Y_NEG_Z": Matrix.Rotation(-pi / 4, 4, "X") @ Matrix.Rotation(-pi / 2, 4, "Z"),
-        "POS_Y_POS_Z": Matrix.Rotation(pi / 4, 4, "X") @ Matrix.Rotation(-pi / 2, 4, "Z"),
+        "NEG_Y_NEG_Z": Matrix.Rotation(pi / 4, 4, "X")
+        @ Matrix.Rotation(pi / 2, 4, "Z"),
+        "NEG_Y_POS_Z": Matrix.Rotation(-pi / 4, 4, "X")
+        @ Matrix.Rotation(pi / 2, 4, "Z"),
+        "POS_Y_NEG_Z": Matrix.Rotation(-pi / 4, 4, "X")
+        @ Matrix.Rotation(-pi / 2, 4, "Z"),
+        "POS_Y_POS_Z": Matrix.Rotation(pi / 4, 4, "X")
+        @ Matrix.Rotation(-pi / 2, 4, "Z"),
     }
     return rotations.get(direction, Matrix.Identity(4))
 
@@ -751,7 +755,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             "flat back face, like a CAD draft. Side walls slope inward at the "
             "draft angle"
         ),
-        default=True,
+        default=False,
     )
     connector_draft_angle: FloatProperty(
         name="Draft Angle (deg)",
@@ -1406,7 +1410,8 @@ def build_solid_bmesh(
         bm.faces.ensure_lookup_table()
         plane_eps = 1e-4
         back_faces = [
-            f for f in bm.faces
+            f
+            for f in bm.faces
             if all(abs(dir_vec.dot(fv.co) - cut_proj) < plane_eps for fv in f.verts)
         ]
 
@@ -1425,9 +1430,7 @@ def build_solid_bmesh(
             for i in range(1, len(pts_2d) - 1):
                 p1x, p1y = pts_2d[i]
                 p2x, p2y = pts_2d[i + 1]
-                tri_area = 0.5 * (
-                    (p1x - p0x) * (p2y - p0y) - (p1y - p0y) * (p2x - p0x)
-                )
+                tri_area = 0.5 * ((p1x - p0x) * (p2y - p0y) - (p1y - p0y) * (p2x - p0x))
                 cx = (p0x + p1x + p2x) / 3.0
                 cy = (p0y + p1y + p2y) / 3.0
                 total_area += tri_area
