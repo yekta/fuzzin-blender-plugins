@@ -744,6 +744,24 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=2.0,
         precision=2,
     )
+    connector_draft_enabled: BoolProperty(
+        name="Draft",
+        description=(
+            "Taper the back of the connector toward the area centroid of its "
+            "flat back face, like a CAD draft. Side walls slope inward at the "
+            "draft angle"
+        ),
+        default=True,
+    )
+    connector_draft_angle: FloatProperty(
+        name="Draft Angle (deg)",
+        description="Draft angle measured from the extrusion direction",
+        default=30.0,
+        min=0.0,
+        max=45.0,
+        step=100,
+        precision=1,
+    )
     connector_direction: EnumProperty(
         name="Direction",
         description="Direction to extrude the feature connector",
@@ -1282,6 +1300,7 @@ def build_solid_bmesh(
     clearance=0.0,
     back_trim=0.5,
     direction="NEG_X",
+    draft_angle_rad=0.0,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -1353,21 +1372,6 @@ def build_solid_bmesh(
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
-    if clearance > 0.0:
-        bm.faces.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        for f in bm.faces:
-            f.normal_update()
-        for v in bm.verts:
-            if not v.link_faces:
-                continue
-            avg_normal = Vector((0, 0, 0))
-            for f in v.link_faces:
-                avg_normal += f.normal
-            if avg_normal.length > 0:
-                avg_normal.normalize()
-            v.co += avg_normal * clearance
-
     # Bisect at the intended back depth to trim thin geometry and create
     # a clean, flat back face.
     cut_proj = extremum_proj + depth
@@ -1388,6 +1392,81 @@ def build_solid_bmesh(
     if cut_edges:
         bmesh.ops.contextual_create(bm, geom=cut_edges)
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+
+    # Draft: taper the flat back inward toward its area centroid. Applied
+    # before clearance so the cutter inflates a drafted connector uniformly.
+    if draft_angle_rad > 1e-6 and depth > 1e-6:
+        shrink = depth * math.tan(draft_angle_rad)
+
+        # Orthonormal basis (u, v) perpendicular to dir_vec.
+        ref = Vector((0, 0, 1)) if abs(dir_vec.z) < 0.9 else Vector((1, 0, 0))
+        u_axis = dir_vec.cross(ref).normalized()
+        v_axis = dir_vec.cross(u_axis).normalized()
+
+        bm.faces.ensure_lookup_table()
+        plane_eps = 1e-4
+        back_faces = [
+            f for f in bm.faces
+            if all(abs(dir_vec.dot(fv.co) - cut_proj) < plane_eps for fv in f.verts)
+        ]
+
+        for back_face in back_faces:
+            face_verts = list(back_face.verts)
+            if len(face_verts) < 3:
+                continue
+
+            pts_2d = [(u_axis.dot(fv.co), v_axis.dot(fv.co)) for fv in face_verts]
+
+            # Area centroid via fan triangulation from pts_2d[0].
+            p0x, p0y = pts_2d[0]
+            total_area = 0.0
+            wx = 0.0
+            wy = 0.0
+            for i in range(1, len(pts_2d) - 1):
+                p1x, p1y = pts_2d[i]
+                p2x, p2y = pts_2d[i + 1]
+                tri_area = 0.5 * (
+                    (p1x - p0x) * (p2y - p0y) - (p1y - p0y) * (p2x - p0x)
+                )
+                cx = (p0x + p1x + p2x) / 3.0
+                cy = (p0y + p1y + p2y) / 3.0
+                total_area += tri_area
+                wx += tri_area * cx
+                wy += tri_area * cy
+
+            if abs(total_area) < 1e-12:
+                continue
+
+            cu = wx / total_area
+            cv = wy / total_area
+
+            eps = 1e-5
+            for fv, (vu, vv) in zip(face_verts, pts_2d):
+                du = cu - vu
+                dv = cv - vv
+                dist = math.sqrt(du * du + dv * dv)
+                if dist < eps:
+                    continue
+                move = min(shrink, dist - eps)
+                factor = move / dist
+                fv.co += u_axis * (du * factor) + v_axis * (dv * factor)
+
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+
+    if clearance > 0.0:
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        for f in bm.faces:
+            f.normal_update()
+        for v in bm.verts:
+            if not v.link_faces:
+                continue
+            avg_normal = Vector((0, 0, 0))
+            for f in v.link_faces:
+                avg_normal += f.normal
+            if avg_normal.length > 0:
+                avg_normal.normalize()
+            v.co += avg_normal * clearance
 
     return bm
 
@@ -1761,6 +1840,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 bpy.ops.object.mode_set(mode="OBJECT")
 
                 direction = props.connector_direction
+                draft_rad = (
+                    math.radians(props.connector_draft_angle)
+                    if props.connector_draft_enabled
+                    else 0.0
+                )
 
                 conn_bm = build_solid_bmesh(
                     face_vert_lists,
@@ -1769,6 +1853,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     edge_face_count,
                     depth,
                     direction=direction,
+                    draft_angle_rad=draft_rad,
                 )
                 conn_mesh = bpy.data.meshes.new("Connector")
                 conn_bm.to_mesh(conn_mesh)
@@ -1786,6 +1871,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     depth,
                     clearance=clearance,
                     direction=direction,
+                    draft_angle_rad=draft_rad,
                 )
                 cutter_mesh = bpy.data.meshes.new("_Cutter")
                 cutter_bm.to_mesh(cutter_mesh)
@@ -1873,10 +1959,16 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 f"{offset_str}"
             )
         if did_connector:
+            draft_str = (
+                f", {props.connector_draft_angle:.0f}° draft"
+                if props.connector_draft_enabled
+                else ""
+            )
             parts.append(
                 f"Feature connector: {props.connector_depth:.1f} mm depth "
                 f"({props.connector_direction}), "
                 f"{props.connector_clearance:.2f} mm clearance"
+                f"{draft_str}"
             )
 
         # ================================================================
@@ -2070,6 +2162,10 @@ class CPIPE_PT_main(bpy.types.Panel):
             col.prop(props, "connector_direction")
             col.prop(props, "connector_depth")
             col.prop(props, "connector_clearance")
+            col.prop(props, "connector_draft_enabled")
+            sub = col.row()
+            sub.enabled = props.connector_draft_enabled
+            sub.prop(props, "connector_draft_angle")
             col.prop(props, "connector_solver")
 
         # ---- Mark Left / Right ----
