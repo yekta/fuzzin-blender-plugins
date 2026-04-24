@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Fuzzin Pipeline",
     "author": "Yekta",
-    "version": (5, 3, 0),
+    "version": (5, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Fuzzin Pipeline",
-    "description": "Scale to Height, Flatten Bottom, Bottom Female Connector, Feature Connectors, and Left/Right Marking in one unified workflow",
+    "description": "Scale to Height, Flatten Bottom, Bottom Female Connector, Feature Connectors, Straight-Cut Pegs, and Left/Right Marking in one unified workflow",
     "category": "Mesh",
 }
 
@@ -834,8 +834,9 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             "best-fit plane through its boundary loop. The plane minimises "
             "the sum of squared distances to the boundary verts and is "
             "oriented into the chosen direction's hemisphere. Produces two "
-            "closed solids — the body and the feature — with matching flat "
-            "interfaces. Overrides depth, clearance, draft and smoothing"
+            "closed solids - the body and the feature - with matching flat "
+            "interfaces, then adds a rotated rectangular male/female peg. "
+            "Overrides extruded depth, draft and smoothing"
         ),
         default=False,
     )
@@ -861,6 +862,42 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         default=0.2,
         min=0.0,
         soft_max=2.0,
+        precision=2,
+    )
+    connector_straight_peg_width: FloatProperty(
+        name="Peg Width",
+        description="Straight cut only: male peg width in the cut plane",
+        default=5.0,
+        min=0.01,
+        soft_max=50.0,
+        precision=2,
+    )
+    connector_straight_peg_height: FloatProperty(
+        name="Peg Height",
+        description="Straight cut only: male peg height in the cut plane",
+        default=3.0,
+        min=0.01,
+        soft_max=50.0,
+        precision=2,
+    )
+    connector_straight_peg_depth: FloatProperty(
+        name="Peg Depth",
+        description="Straight cut only: male peg protrusion depth into the smaller part",
+        default=3.0,
+        min=0.01,
+        soft_max=50.0,
+        precision=2,
+    )
+    connector_straight_peg_inset: FloatProperty(
+        name="Peg Inset",
+        description=(
+            "Straight cut only: how far the male peg is inset into the body. "
+            "The inset side is clipped to the body so it cannot protrude "
+            "through thin parts"
+        ),
+        default=2.0,
+        min=0.0,
+        soft_max=50.0,
         precision=2,
     )
     connector_direction: EnumProperty(
@@ -2048,6 +2085,245 @@ def build_straight_cut_body_cleanup_bm(
     return bm
 
 
+def _largest_loop_centroid(loop_positions, plane_no):
+    """Return the area centroid of the largest straight-cut boundary loop."""
+    axis = plane_no.normalized() if plane_no.length > 1e-9 else Vector((1, 0, 0))
+    u_axis, v_axis = _planar_basis(axis)
+
+    best_center = None
+    best_area = 0.0
+
+    for loop in loop_positions:
+        n = len(loop)
+        if n < 3:
+            continue
+
+        pts_2d = [(u_axis.dot(p), v_axis.dot(p)) for p in loop]
+        cross_sum = 0.0
+        cx_sum = 0.0
+        cy_sum = 0.0
+        for i in range(n):
+            x0, y0 = pts_2d[i]
+            x1, y1 = pts_2d[(i + 1) % n]
+            cross = x0 * y1 - x1 * y0
+            cross_sum += cross
+            cx_sum += (x0 + x1) * cross
+            cy_sum += (y0 + y1) * cross
+
+        area = abs(cross_sum) * 0.5
+        if area <= best_area:
+            continue
+
+        if abs(cross_sum) > 1e-9:
+            cu = cx_sum / (3.0 * cross_sum)
+            cv = cy_sum / (3.0 * cross_sum)
+            cn = sum(axis.dot(p) for p in loop) / n
+            center = u_axis * cu + v_axis * cv + axis * cn
+        else:
+            center = Vector((0, 0, 0))
+            for p in loop:
+                center += p
+            center /= n
+
+        best_area = area
+        best_center = center
+
+    if best_center is not None:
+        return best_center
+
+    points = [p for loop in loop_positions for p in loop]
+    if not points:
+        return Vector((0, 0, 0))
+    center = Vector((0, 0, 0))
+    for p in points:
+        center += p
+    return center / len(points)
+
+
+def _straight_peg_basis(cut_axis, world_up_local=None, angle_rad=math.pi / 4.0):
+    """Return prism axes for a peg tilted 45 degrees to the XY plane.
+
+    Local X/depth is the tilted connector axis, local Y/width is the rotation
+    axis, and local Z/height is perpendicular to both.  This is equivalent to
+    taking a horizontal rectangular prism and rotating it around its Y axis.
+    """
+    cut_axis = cut_axis.normalized() if cut_axis.length > 1e-9 else Vector((1, 0, 0))
+
+    ref = (
+        world_up_local.normalized()
+        if world_up_local is not None and world_up_local.length > 1e-9
+        else Vector((0, 0, 1))
+    )
+    base_depth = cut_axis - ref * cut_axis.dot(ref)
+
+    if base_depth.length < 1e-9:
+        fallback_u, _ = _planar_basis(ref)
+        base_depth = fallback_u
+        if base_depth.dot(cut_axis) < 0.0:
+            base_depth = -base_depth
+    else:
+        base_depth.normalize()
+
+    if base_depth.dot(cut_axis) < 0.0:
+        base_depth = -base_depth
+
+    width_axis = ref.cross(base_depth)
+    if width_axis.length < 1e-9:
+        width_axis, _ = _planar_basis(base_depth)
+    else:
+        width_axis.normalize()
+
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    candidates = [
+        (base_depth * c + ref * s).normalized(),
+        (base_depth * c - ref * s).normalized(),
+    ]
+    tilted_depth = candidates[0]
+    valid = [cand for cand in candidates if cand.dot(cut_axis) > 1e-6]
+    if valid:
+        tilted_depth = max(valid, key=lambda cand: cand.dot(ref))
+    else:
+        tilted_depth = max(candidates, key=lambda cand: cand.dot(cut_axis))
+
+    height_axis = tilted_depth.cross(width_axis)
+    if height_axis.length < 1e-9:
+        _, height_axis = _planar_basis(tilted_depth)
+    else:
+        height_axis.normalize()
+    if height_axis.dot(ref) < 0.0:
+        height_axis = -height_axis
+
+    return tilted_depth, width_axis, height_axis
+
+
+def build_rotated_rect_prism_bm(
+    center,
+    cut_axis,
+    width,
+    height,
+    start_offset,
+    end_offset,
+    world_up_local=None,
+    clearance=0.0,
+):
+    """Build a rectangular prism tilted 45 degrees against the XY plane.
+
+    *start_offset* and *end_offset* are measured from *center* along the
+    tilted local X/depth axis. Positive offsets point from the body side
+    toward the small straight-cut feature. *clearance* grows the female
+    cutter in local Y/Z.
+    """
+    bm = bmesh.new()
+
+    t0 = min(start_offset, end_offset)
+    t1 = max(start_offset, end_offset)
+    if t1 - t0 < 1e-9:
+        return bm
+
+    half_w = width * 0.5 + clearance
+    half_h = height * 0.5 + clearance
+    if half_w <= 1e-9 or half_h <= 1e-9:
+        return bm
+
+    depth_axis, width_axis, height_axis = _straight_peg_basis(
+        cut_axis, world_up_local
+    )
+
+    def make_ring(t):
+        c = center + depth_axis * t
+        return [
+            bm.verts.new(c - width_axis * half_w - height_axis * half_h),
+            bm.verts.new(c + width_axis * half_w - height_axis * half_h),
+            bm.verts.new(c + width_axis * half_w + height_axis * half_h),
+            bm.verts.new(c - width_axis * half_w + height_axis * half_h),
+        ]
+
+    start_ring = make_ring(t0)
+    end_ring = make_ring(t1)
+    bm.verts.ensure_lookup_table()
+
+    try:
+        bm.faces.new(list(reversed(start_ring)))
+    except ValueError:
+        pass
+    try:
+        bm.faces.new(end_ring)
+    except ValueError:
+        pass
+
+    n = len(start_ring)
+    for i in range(n):
+        j = (i + 1) % n
+        try:
+            bm.faces.new([start_ring[i], start_ring[j], end_ring[j], end_ring[i]])
+        except ValueError:
+            pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm
+
+
+def _append_bmesh(dst_bm, src_bm):
+    """Append all geometry from *src_bm* into *dst_bm*."""
+    vmap = {}
+    for v in src_bm.verts:
+        vmap[v] = dst_bm.verts.new(v.co.copy())
+    dst_bm.verts.ensure_lookup_table()
+
+    for f in src_bm.faces:
+        try:
+            dst_bm.faces.new([vmap[v] for v in f.verts])
+        except ValueError:
+            pass
+
+
+def _clip_bmesh_by_plane(bm, plane_co, plane_no, keep_positive):
+    """Clip *bm* against a plane and fill the new cut boundary."""
+    if len(bm.faces) == 0:
+        return
+
+    geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+    result = bmesh.ops.bisect_plane(
+        bm,
+        geom=geom,
+        plane_co=plane_co,
+        plane_no=plane_no,
+        clear_outer=not keep_positive,
+        clear_inner=keep_positive,
+    )
+
+    cut_edges = [e for e in result["geom_cut"] if isinstance(e, bmesh.types.BMEdge)]
+    if cut_edges:
+        bmesh.ops.contextual_create(bm, geom=cut_edges)
+
+    orphans = [v for v in bm.verts if not v.link_faces]
+    if orphans:
+        bmesh.ops.delete(bm, geom=orphans, context="VERTS")
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+
+
+def _mesh_object_from_bmesh(context, name, bm, matrix_world=None):
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+
+    obj = bpy.data.objects.new(name, mesh)
+    if matrix_world is not None:
+        obj.matrix_world = matrix_world.copy()
+    context.collection.objects.link(obj)
+    context.view_layer.update()
+    return obj
+
+
+def _remove_mesh_object(obj):
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
 # ===========================================================================
 # YZ-Plane Offset Cutter (Boolean step)
 # ===========================================================================
@@ -2163,18 +2439,27 @@ def _mesh_center_of_gravity_xy(obj):
 # ===========================================================================
 
 
-def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=None):
-    """Apply a Boolean DIFFERENCE modifier and clean up the cutter.
+def apply_boolean_operation(
+    context,
+    target_obj,
+    operand_obj,
+    solver,
+    operation="DIFFERENCE",
+    report_fn=None,
+    remove_operand=False,
+):
+    """Apply a Boolean modifier.
 
-    Returns True on success, False on failure.
+    When *remove_operand* is true, the operand mesh object is deleted after
+    the modifier is applied. Returns True on success, False on failure.
     """
     bpy.ops.object.select_all(action="DESELECT")
     target_obj.select_set(True)
     context.view_layer.objects.active = target_obj
 
-    bool_mod = target_obj.modifiers.new(name="_BoolCut", type="BOOLEAN")
-    bool_mod.operation = "DIFFERENCE"
-    bool_mod.object = cutter_obj
+    bool_mod = target_obj.modifiers.new(name="_BoolOp", type="BOOLEAN")
+    bool_mod.operation = operation
+    bool_mod.object = operand_obj
     bool_mod.solver = solver
     try:
         bool_mod.use_hole_tolerant = True
@@ -2189,12 +2474,26 @@ def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=
             report_fn({"WARNING"}, f"Boolean issue: {e}")
         success = False
 
-    # Clean up cutter
-    cutter_data = cutter_obj.data
-    bpy.data.objects.remove(cutter_obj, do_unlink=True)
-    bpy.data.meshes.remove(cutter_data)
+    if remove_operand:
+        _remove_mesh_object(operand_obj)
 
     return success
+
+
+def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=None):
+    """Apply a Boolean DIFFERENCE modifier and clean up the cutter.
+
+    Returns True on success, False on failure.
+    """
+    return apply_boolean_operation(
+        context,
+        target_obj,
+        cutter_obj,
+        solver,
+        operation="DIFFERENCE",
+        report_fn=report_fn,
+        remove_operand=True,
+    )
 
 
 # ===========================================================================
@@ -2329,6 +2628,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
         did_flatten = False
         did_bottom_conn = False
         did_connector = False
+        did_straight_peg = False
         did_boolean = False
         did_export = False
         export_count = 0
@@ -2712,6 +3012,124 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         conn_obj.matrix_world = obj.matrix_world.copy()
                         context.collection.objects.link(conn_obj)
 
+                        peg_center = _largest_loop_centroid(
+                            boundary_loops_local, local_plane_no
+                        )
+                        world_up_local = world_inv.to_3x3() @ Vector((0, 0, 1))
+                        peg_width = props.connector_straight_peg_width
+                        peg_height = props.connector_straight_peg_height
+                        peg_depth = props.connector_straight_peg_depth
+                        peg_inset = props.connector_straight_peg_inset
+                        peg_clearance = props.connector_clearance
+                        back_span = max(peg_inset, peg_height + peg_clearance + 0.1)
+
+                        peg_bm = bmesh.new()
+
+                        if peg_inset > 1e-6:
+                            root_bm = build_rotated_rect_prism_bm(
+                                peg_center,
+                                local_plane_no,
+                                peg_width,
+                                peg_height,
+                                -peg_inset,
+                                peg_depth,
+                                world_up_local=world_up_local,
+                            )
+                            _clip_bmesh_by_plane(
+                                root_bm,
+                                local_plane_co,
+                                local_plane_no,
+                                keep_positive=False,
+                            )
+                            if len(root_bm.faces) > 0:
+                                root_obj = _mesh_object_from_bmesh(
+                                    context,
+                                    "_StraightPegRoot",
+                                    root_bm,
+                                    obj.matrix_world,
+                                )
+                                root_ok = apply_boolean_operation(
+                                    context,
+                                    root_obj,
+                                    obj,
+                                    props.connector_solver,
+                                    operation="INTERSECT",
+                                    report_fn=self.report,
+                                )
+                                if root_ok and len(root_obj.data.polygons) > 0:
+                                    peg_bm.from_mesh(root_obj.data)
+                                _remove_mesh_object(root_obj)
+                            else:
+                                root_bm.free()
+
+                        protrusion_bm = build_rotated_rect_prism_bm(
+                            peg_center,
+                            local_plane_no,
+                            peg_width,
+                            peg_height,
+                            -back_span,
+                            peg_depth,
+                            world_up_local=world_up_local,
+                        )
+                        _clip_bmesh_by_plane(
+                            protrusion_bm,
+                            local_plane_co,
+                            local_plane_no,
+                            keep_positive=True,
+                        )
+                        _append_bmesh(peg_bm, protrusion_bm)
+                        protrusion_bm.free()
+
+                        male_ok = False
+                        if len(peg_bm.faces) > 0:
+                            bmesh.ops.recalc_face_normals(
+                                peg_bm, faces=peg_bm.faces[:]
+                            )
+                            peg_obj = _mesh_object_from_bmesh(
+                                context,
+                                "_StraightPeg",
+                                peg_bm,
+                                obj.matrix_world,
+                            )
+                            male_ok = apply_boolean_operation(
+                                context,
+                                obj,
+                                peg_obj,
+                                props.connector_solver,
+                                operation="UNION",
+                                report_fn=self.report,
+                                remove_operand=True,
+                            )
+                        else:
+                            peg_bm.free()
+
+                        female_overlap = max(back_span, 0.05, peg_clearance)
+                        female_bm = build_rotated_rect_prism_bm(
+                            peg_center,
+                            local_plane_no,
+                            peg_width,
+                            peg_height,
+                            -female_overlap,
+                            peg_depth + peg_clearance,
+                            world_up_local=world_up_local,
+                            clearance=peg_clearance,
+                        )
+                        female_obj = _mesh_object_from_bmesh(
+                            context,
+                            "_StraightPegSocket",
+                            female_bm,
+                            conn_obj.matrix_world,
+                        )
+                        female_ok = apply_boolean_difference(
+                            context,
+                            conn_obj,
+                            female_obj,
+                            props.connector_solver,
+                            self.report,
+                        )
+
+                        did_straight_peg = male_ok and female_ok
+
                         bpy.ops.object.select_all(action="DESELECT")
                         conn_obj.select_set(True)
                         obj.select_set(True)
@@ -2890,9 +3308,19 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
             )
         if did_connector:
             if props.connector_straight_cut_enabled:
+                peg_str = ""
+                if did_straight_peg:
+                    peg_str = (
+                        f", peg {props.connector_straight_peg_width:.1f} x "
+                        f"{props.connector_straight_peg_height:.1f} x "
+                        f"{props.connector_straight_peg_depth:.1f} mm"
+                        f", {props.connector_straight_peg_inset:.1f} mm inset"
+                        f", {props.connector_clearance:.2f} mm clearance"
+                    )
                 parts.append(
                     f"Straight cut ({props.connector_direction}): "
                     f"best-fit plane through boundary"
+                    f"{peg_str}"
                 )
             else:
                 draft_str = (
@@ -3113,6 +3541,12 @@ class CPIPE_PT_main(bpy.types.Panel):
             straight_col.enabled = props.connector_straight_cut_enabled
             straight_col.prop(props, "connector_straight_offset_clearance")
             straight_col.prop(props, "connector_straight_depth_clearance")
+            straight_col.separator()
+            straight_col.prop(props, "connector_straight_peg_width")
+            straight_col.prop(props, "connector_straight_peg_height")
+            straight_col.prop(props, "connector_straight_peg_depth")
+            straight_col.prop(props, "connector_straight_peg_inset")
+            straight_col.prop(props, "connector_clearance", text="Female Clearance")
 
             extrude_col = col.column(align=True)
             extrude_col.enabled = not props.connector_straight_cut_enabled
