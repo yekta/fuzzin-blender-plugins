@@ -867,7 +867,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_straight_peg_width: FloatProperty(
         name="Peg Width",
         description="Straight cut only: male peg width in the cut plane",
-        default=5.0,
+        default=3.0,
         min=0.01,
         soft_max=50.0,
         precision=2,
@@ -880,23 +880,11 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=50.0,
         precision=2,
     )
-    connector_straight_peg_depth: FloatProperty(
-        name="Peg Depth",
-        description="Straight cut only: male peg protrusion depth into the smaller part",
-        default=3.0,
+    connector_straight_peg_protrusion: FloatProperty(
+        name="Peg Protrusion",
+        description="Straight cut only: male peg protrusion from the cut plane into the smaller part",
+        default=2.5,
         min=0.01,
-        soft_max=50.0,
-        precision=2,
-    )
-    connector_straight_peg_inset: FloatProperty(
-        name="Peg Inset",
-        description=(
-            "Straight cut only: how far the male peg is inset into the body. "
-            "The inset side is clipped to the body so it cannot protrude "
-            "through thin parts"
-        ),
-        default=2.0,
-        min=0.0,
         soft_max=50.0,
         precision=2,
     )
@@ -2226,9 +2214,7 @@ def build_rotated_rect_prism_bm(
     if half_w <= 1e-9 or half_h <= 1e-9:
         return bm
 
-    depth_axis, width_axis, height_axis = _straight_peg_basis(
-        cut_axis, world_up_local
-    )
+    depth_axis, width_axis, height_axis = _straight_peg_basis(cut_axis, world_up_local)
 
     def make_ring(t):
         c = center + depth_axis * t
@@ -3018,49 +3004,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         world_up_local = world_inv.to_3x3() @ Vector((0, 0, 1))
                         peg_width = props.connector_straight_peg_width
                         peg_height = props.connector_straight_peg_height
-                        peg_depth = props.connector_straight_peg_depth
-                        peg_inset = props.connector_straight_peg_inset
+                        peg_protrusion = props.connector_straight_peg_protrusion
                         peg_clearance = props.connector_clearance
-                        back_span = max(peg_inset, peg_height + peg_clearance + 0.1)
+                        back_span = max(peg_height + peg_clearance + 0.1, 0.1)
 
                         peg_bm = bmesh.new()
-
-                        if peg_inset > 1e-6:
-                            root_bm = build_rotated_rect_prism_bm(
-                                peg_center,
-                                local_plane_no,
-                                peg_width,
-                                peg_height,
-                                -peg_inset,
-                                peg_depth,
-                                world_up_local=world_up_local,
-                            )
-                            _clip_bmesh_by_plane(
-                                root_bm,
-                                local_plane_co,
-                                local_plane_no,
-                                keep_positive=False,
-                            )
-                            if len(root_bm.faces) > 0:
-                                root_obj = _mesh_object_from_bmesh(
-                                    context,
-                                    "_StraightPegRoot",
-                                    root_bm,
-                                    obj.matrix_world,
-                                )
-                                root_ok = apply_boolean_operation(
-                                    context,
-                                    root_obj,
-                                    obj,
-                                    props.connector_solver,
-                                    operation="INTERSECT",
-                                    report_fn=self.report,
-                                )
-                                if root_ok and len(root_obj.data.polygons) > 0:
-                                    peg_bm.from_mesh(root_obj.data)
-                                _remove_mesh_object(root_obj)
-                            else:
-                                root_bm.free()
 
                         protrusion_bm = build_rotated_rect_prism_bm(
                             peg_center,
@@ -3068,7 +3016,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             peg_width,
                             peg_height,
                             -back_span,
-                            peg_depth,
+                            peg_protrusion,
                             world_up_local=world_up_local,
                         )
                         _clip_bmesh_by_plane(
@@ -3082,9 +3030,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                         male_ok = False
                         if len(peg_bm.faces) > 0:
-                            bmesh.ops.recalc_face_normals(
-                                peg_bm, faces=peg_bm.faces[:]
-                            )
+                            bmesh.ops.recalc_face_normals(peg_bm, faces=peg_bm.faces[:])
                             peg_obj = _mesh_object_from_bmesh(
                                 context,
                                 "_StraightPeg",
@@ -3110,7 +3056,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             peg_width,
                             peg_height,
                             -female_overlap,
-                            peg_depth + peg_clearance,
+                            peg_protrusion + peg_clearance,
                             world_up_local=world_up_local,
                             clearance=peg_clearance,
                         )
@@ -3312,9 +3258,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 if did_straight_peg:
                     peg_str = (
                         f", peg {props.connector_straight_peg_width:.1f} x "
-                        f"{props.connector_straight_peg_height:.1f} x "
-                        f"{props.connector_straight_peg_depth:.1f} mm"
-                        f", {props.connector_straight_peg_inset:.1f} mm inset"
+                        f"{props.connector_straight_peg_height:.1f} mm"
+                        f", {props.connector_straight_peg_protrusion:.1f} mm protrusion"
                         f", {props.connector_clearance:.2f} mm clearance"
                     )
                 parts.append(
@@ -3544,8 +3489,7 @@ class CPIPE_PT_main(bpy.types.Panel):
             straight_col.separator()
             straight_col.prop(props, "connector_straight_peg_width")
             straight_col.prop(props, "connector_straight_peg_height")
-            straight_col.prop(props, "connector_straight_peg_depth")
-            straight_col.prop(props, "connector_straight_peg_inset")
+            straight_col.prop(props, "connector_straight_peg_protrusion")
             straight_col.prop(props, "connector_clearance", text="Female Clearance")
 
             extrude_col = col.column(align=True)
