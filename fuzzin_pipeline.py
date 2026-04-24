@@ -827,6 +827,18 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         min=1,
         max=50,
     )
+    connector_straight_cut_enabled: BoolProperty(
+        name="Straight Cut",
+        description=(
+            "Instead of an extruded plug, separate the feature with a single "
+            "best-fit plane through its boundary loop. The plane minimises "
+            "the sum of squared distances to the boundary verts and is "
+            "oriented into the chosen direction's hemisphere. Produces two "
+            "closed solids — the body and the feature — with matching flat "
+            "interfaces. Overrides depth, clearance, draft and smoothing"
+        ),
+        default=False,
+    )
     connector_direction: EnumProperty(
         name="Direction",
         description="Direction to extrude the feature connector",
@@ -1814,6 +1826,116 @@ def build_solid_bmesh(
 
 
 # ===========================================================================
+# Straight Cut — Best-Fit Plane Bisection
+# ===========================================================================
+
+
+def fit_best_plane(points, preferred_normal=None):
+    """Least-squares best-fit plane through *points* (world space).
+
+    The plane passes through the centroid and has normal equal to the
+    eigenvector of the smallest eigenvalue of the point-cloud covariance
+    matrix — the direction of least variance, which minimises the sum of
+    squared orthogonal distances from the points to the plane.
+
+    When *preferred_normal* is supplied, the returned normal is flipped
+    as needed so it lies in the same hemisphere (positive dot product).
+    """
+    n = len(points)
+    fallback = (
+        preferred_normal.normalized() if preferred_normal else Vector((0, 0, 1))
+    )
+    if n == 0:
+        return Vector((0, 0, 0)), fallback
+
+    centroid = Vector((0, 0, 0))
+    for p in points:
+        centroid = centroid + p
+    centroid = centroid / n
+
+    if n < 3:
+        return centroid, fallback
+
+    xx = xy = xz = yy = yz = zz = 0.0
+    for p in points:
+        d = p - centroid
+        xx += d.x * d.x
+        xy += d.x * d.y
+        xz += d.x * d.z
+        yy += d.y * d.y
+        yz += d.y * d.z
+        zz += d.z * d.z
+
+    import numpy as _np
+    cov = _np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
+    _, eigvecs = _np.linalg.eigh(cov)
+    nrm = Vector(
+        (float(eigvecs[0, 0]), float(eigvecs[1, 0]), float(eigvecs[2, 0]))
+    )
+
+    if nrm.length < 1e-9:
+        nrm = fallback
+    else:
+        nrm.normalize()
+
+    if preferred_normal is not None and nrm.dot(preferred_normal) < 0:
+        nrm = -nrm
+
+    return centroid, nrm
+
+
+def split_by_feature_faces(obj, feature_face_set, boundary_loops, keep_feature):
+    """Build a closed bmesh from *obj.data* containing either the feature
+    half (*keep_feature=True*) or the rest (*keep_feature=False*).
+
+    Uses the existing face selection as the cut — not an infinite plane —
+    so the split is confined to the boundary loop and never leaks into
+    unrelated parts of the mesh.
+
+    Each boundary loop is closed with one cap face. If the caller has
+    already snapped the boundary verts onto a common plane, the foot's
+    cap and the body's cap coincide exactly and both halves share a
+    matching flat interface.
+    """
+    me = obj.data
+    bm = bmesh.new()
+
+    # Mirror every vert so local indices match obj.data.vertices indices
+    # (face and loop lookups below use those indices directly).
+    for v in me.vertices:
+        bm.verts.new(v.co)
+    bm.verts.ensure_lookup_table()
+
+    for fi, poly in enumerate(me.polygons):
+        is_feature = fi in feature_face_set
+        if keep_feature != is_feature:
+            continue
+        try:
+            bm.faces.new([bm.verts[vi] for vi in poly.vertices])
+        except ValueError:
+            pass
+
+    # Cap each boundary loop. The two halves need opposite winding so
+    # each cap's outward normal points away from its own volume; we
+    # flip for the body side and let recalc_face_normals sort any drift.
+    for loop in boundary_loops:
+        cap_verts = [bm.verts[vi] for vi in loop]
+        if not keep_feature:
+            cap_verts = list(reversed(cap_verts))
+        try:
+            bm.faces.new(cap_verts)
+        except ValueError:
+            pass
+
+    orphans = [v for v in bm.verts if not v.link_faces]
+    if orphans:
+        bmesh.ops.delete(bm, geom=orphans, context="VERTS")
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm
+
+
+# ===========================================================================
 # YZ-Plane Offset Cutter (Boolean step)
 # ===========================================================================
 
@@ -2320,95 +2442,161 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     else 0.0
                 )
 
-                # Smooth the feature boundary loop in-plane so the connector
-                # and cutter share a clean, non-jagged perimeter.  2D outward
-                # normals (re)computed from the smoothed coords feed the
-                # planar-offset clearance step inside build_solid_bmesh.
                 dir_vec = _parse_direction(direction)
                 boundary_loops = build_boundary_loops(edge_face_count)
-                if props.connector_smooth_enabled:
-                    smooth_boundary_loops(
-                        boundary_loops,
+
+                if props.connector_straight_cut_enabled:
+                    world_mat = obj.matrix_world
+                    world_inv = world_mat.inverted()
+                    boundary_vis = []
+                    boundary_pts_world = []
+                    seen = set()
+                    for loop in boundary_loops:
+                        for vi in loop:
+                            if vi in seen:
+                                continue
+                            seen.add(vi)
+                            boundary_vis.append(vi)
+                            boundary_pts_world.append(
+                                world_mat @ obj.data.vertices[vi].co
+                            )
+
+                    if len(boundary_pts_world) < 3:
+                        self.report(
+                            {"WARNING"},
+                            "Boundary loop too small for straight cut",
+                        )
+                    else:
+                        plane_co, plane_normal = fit_best_plane(
+                            boundary_pts_world, preferred_normal=dir_vec
+                        )
+
+                        # Snap every boundary vert onto the best-fit plane
+                        # so the cap face on each half is flat and the
+                        # body's cap and the foot's cap coincide exactly.
+                        for vi, pt in zip(boundary_vis, boundary_pts_world):
+                            signed_dist = (pt - plane_co).dot(plane_normal)
+                            snapped = pt - plane_normal * signed_dist
+                            obj.data.vertices[vi].co = world_inv @ snapped
+                        obj.data.update()
+
+                        foot_bm = split_by_feature_faces(
+                            obj,
+                            selected_faces_set,
+                            boundary_loops,
+                            keep_feature=True,
+                        )
+                        foot_mesh = bpy.data.meshes.new("Connector")
+                        foot_bm.to_mesh(foot_mesh)
+                        foot_bm.free()
+
+                        body_bm = split_by_feature_faces(
+                            obj,
+                            selected_faces_set,
+                            boundary_loops,
+                            keep_feature=False,
+                        )
+                        body_bm.to_mesh(obj.data)
+                        body_bm.free()
+
+                        conn_obj = bpy.data.objects.new("Connector", foot_mesh)
+                        conn_obj.matrix_world = obj.matrix_world.copy()
+                        context.collection.objects.link(conn_obj)
+
+                        bpy.ops.object.select_all(action="DESELECT")
+                        conn_obj.select_set(True)
+                        obj.select_set(True)
+                        context.view_layer.objects.active = conn_obj
+
+                        did_connector = True
+                else:
+                    # Smooth the feature boundary loop in-plane so the connector
+                    # and cutter share a clean, non-jagged perimeter.  2D outward
+                    # normals (re)computed from the smoothed coords feed the
+                    # planar-offset clearance step inside build_solid_bmesh.
+                    if props.connector_smooth_enabled:
+                        smooth_boundary_loops(
+                            boundary_loops,
+                            vert_coords,
+                            dir_vec,
+                            iterations=props.connector_smooth_iterations,
+                        )
+                    boundary_normals = boundary_2d_outward_normals(
+                        boundary_loops, vert_coords, dir_vec
+                    )
+
+                    conn_bm = build_solid_bmesh(
+                        face_vert_lists,
                         vert_coords,
-                        dir_vec,
-                        iterations=props.connector_smooth_iterations,
+                        selected_verts_set,
+                        edge_face_count,
+                        depth,
+                        direction=direction,
+                        draft_angle_rad=draft_rad,
+                        boundary_2d_normals=boundary_normals,
                     )
-                boundary_normals = boundary_2d_outward_normals(
-                    boundary_loops, vert_coords, dir_vec
-                )
+                    conn_mesh = bpy.data.meshes.new("Connector")
+                    conn_bm.to_mesh(conn_mesh)
+                    conn_bm.free()
 
-                conn_bm = build_solid_bmesh(
-                    face_vert_lists,
-                    vert_coords,
-                    selected_verts_set,
-                    edge_face_count,
-                    depth,
-                    direction=direction,
-                    draft_angle_rad=draft_rad,
-                    boundary_2d_normals=boundary_normals,
-                )
-                conn_mesh = bpy.data.meshes.new("Connector")
-                conn_bm.to_mesh(conn_mesh)
-                conn_bm.free()
+                    conn_obj = bpy.data.objects.new("Connector", conn_mesh)
+                    conn_obj.matrix_world = obj.matrix_world.copy()
+                    context.collection.objects.link(conn_obj)
 
-                conn_obj = bpy.data.objects.new("Connector", conn_mesh)
-                conn_obj.matrix_world = obj.matrix_world.copy()
-                context.collection.objects.link(conn_obj)
-
-                cutter_bm = build_solid_bmesh(
-                    face_vert_lists,
-                    vert_coords,
-                    selected_verts_set,
-                    edge_face_count,
-                    depth,
-                    clearance=clearance,
-                    direction=direction,
-                    draft_angle_rad=draft_rad,
-                    forward_clearance=(
-                        props.connector_neg_dir_clearance_value
-                        if props.connector_neg_dir_clearance
-                        else 0.0
-                    ),
-                    boundary_2d_normals=boundary_normals,
-                )
-                cutter_mesh = bpy.data.meshes.new("_Cutter")
-                cutter_bm.to_mesh(cutter_mesh)
-                cutter_bm.free()
-
-                cutter_obj = bpy.data.objects.new("_Cutter", cutter_mesh)
-                cutter_obj.matrix_world = obj.matrix_world.copy()
-                context.collection.objects.link(cutter_obj)
-
-                bpy.ops.object.select_all(action="DESELECT")
-                obj.select_set(True)
-                context.view_layer.objects.active = obj
-
-                bool_mod = obj.modifiers.new(name="ConnectorSlot", type="BOOLEAN")
-                bool_mod.operation = "DIFFERENCE"
-                bool_mod.object = cutter_obj
-                bool_mod.solver = props.connector_solver
-                try:
-                    bool_mod.use_hole_tolerant = True
-                except AttributeError:
-                    pass
-
-                try:
-                    bpy.ops.object.modifier_apply(modifier=bool_mod.name)
-                except RuntimeError as e:
-                    self.report(
-                        {"WARNING"}, f"Boolean had issues: {e}. Check geometry."
+                    cutter_bm = build_solid_bmesh(
+                        face_vert_lists,
+                        vert_coords,
+                        selected_verts_set,
+                        edge_face_count,
+                        depth,
+                        clearance=clearance,
+                        direction=direction,
+                        draft_angle_rad=draft_rad,
+                        forward_clearance=(
+                            props.connector_neg_dir_clearance_value
+                            if props.connector_neg_dir_clearance
+                            else 0.0
+                        ),
+                        boundary_2d_normals=boundary_normals,
                     )
+                    cutter_mesh = bpy.data.meshes.new("_Cutter")
+                    cutter_bm.to_mesh(cutter_mesh)
+                    cutter_bm.free()
 
-                cutter_data = cutter_obj.data
-                bpy.data.objects.remove(cutter_obj, do_unlink=True)
-                bpy.data.meshes.remove(cutter_data)
+                    cutter_obj = bpy.data.objects.new("_Cutter", cutter_mesh)
+                    cutter_obj.matrix_world = obj.matrix_world.copy()
+                    context.collection.objects.link(cutter_obj)
 
-                bpy.ops.object.select_all(action="DESELECT")
-                conn_obj.select_set(True)
-                obj.select_set(True)
-                context.view_layer.objects.active = conn_obj
+                    bpy.ops.object.select_all(action="DESELECT")
+                    obj.select_set(True)
+                    context.view_layer.objects.active = obj
 
-                did_connector = True
+                    bool_mod = obj.modifiers.new(name="ConnectorSlot", type="BOOLEAN")
+                    bool_mod.operation = "DIFFERENCE"
+                    bool_mod.object = cutter_obj
+                    bool_mod.solver = props.connector_solver
+                    try:
+                        bool_mod.use_hole_tolerant = True
+                    except AttributeError:
+                        pass
+
+                    try:
+                        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+                    except RuntimeError as e:
+                        self.report(
+                            {"WARNING"}, f"Boolean had issues: {e}. Check geometry."
+                        )
+
+                    cutter_data = cutter_obj.data
+                    bpy.data.objects.remove(cutter_obj, do_unlink=True)
+                    bpy.data.meshes.remove(cutter_data)
+
+                    bpy.ops.object.select_all(action="DESELECT")
+                    conn_obj.select_set(True)
+                    obj.select_set(True)
+                    context.view_layer.objects.active = conn_obj
+
+                    did_connector = True
 
                 # Save current feature seeds as previous, then reset
                 current_seeds = list(obj.get("cpipe_feature_seeds", []))
@@ -2492,23 +2680,29 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 f"{offset_str}"
             )
         if did_connector:
-            draft_str = (
-                f", {props.connector_draft_angle:.0f}° draft"
-                if props.connector_draft_enabled
-                else ""
-            )
-            neg_dir_str = (
-                f" +{props.connector_neg_dir_clearance_value:.2f} mm neg-dir"
-                if props.connector_neg_dir_clearance
-                else ""
-            )
-            parts.append(
-                f"Feature connector: {props.connector_depth:.1f} mm depth "
-                f"({props.connector_direction}), "
-                f"{props.connector_clearance:.2f} mm clearance"
-                f"{neg_dir_str}"
-                f"{draft_str}"
-            )
+            if props.connector_straight_cut_enabled:
+                parts.append(
+                    f"Straight cut ({props.connector_direction}): "
+                    f"best-fit plane through boundary"
+                )
+            else:
+                draft_str = (
+                    f", {props.connector_draft_angle:.0f}° draft"
+                    if props.connector_draft_enabled
+                    else ""
+                )
+                neg_dir_str = (
+                    f" +{props.connector_neg_dir_clearance_value:.2f} mm neg-dir"
+                    if props.connector_neg_dir_clearance
+                    else ""
+                )
+                parts.append(
+                    f"Feature connector: {props.connector_depth:.1f} mm depth "
+                    f"({props.connector_direction}), "
+                    f"{props.connector_clearance:.2f} mm clearance"
+                    f"{neg_dir_str}"
+                    f"{draft_str}"
+                )
         if did_boolean:
             parts.append(
                 f"Boolean: {props.boolean_tool.name} - {props.boolean_clearance:.3f} mm "
@@ -2704,20 +2898,25 @@ class CPIPE_PT_main(bpy.types.Panel):
 
             col = box.column(align=True)
             col.prop(props, "connector_direction")
-            col.prop(props, "connector_depth")
-            col.prop(props, "connector_clearance")
-            col.prop(props, "connector_neg_dir_clearance")
-            sub = col.row()
+            col.prop(props, "connector_straight_cut_enabled")
+
+            extrude_col = col.column(align=True)
+            extrude_col.enabled = not props.connector_straight_cut_enabled
+            extrude_col.prop(props, "connector_depth")
+            extrude_col.prop(props, "connector_clearance")
+            extrude_col.prop(props, "connector_neg_dir_clearance")
+            sub = extrude_col.row()
             sub.enabled = props.connector_neg_dir_clearance
             sub.prop(props, "connector_neg_dir_clearance_value")
-            col.prop(props, "connector_draft_enabled")
-            sub = col.row()
+            extrude_col.prop(props, "connector_draft_enabled")
+            sub = extrude_col.row()
             sub.enabled = props.connector_draft_enabled
             sub.prop(props, "connector_draft_angle")
-            col.prop(props, "connector_smooth_enabled")
-            sub = col.row()
+            extrude_col.prop(props, "connector_smooth_enabled")
+            sub = extrude_col.row()
             sub.enabled = props.connector_smooth_enabled
             sub.prop(props, "connector_smooth_iterations")
+
             col.prop(props, "connector_solver")
 
         # ---- Boolean ----
