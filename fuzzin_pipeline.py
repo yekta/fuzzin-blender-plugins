@@ -1884,7 +1884,9 @@ def fit_best_plane(points, preferred_normal=None):
     return centroid, nrm
 
 
-def split_by_feature_faces(obj, feature_face_set, boundary_loops, keep_feature):
+def split_by_feature_faces(
+    obj, feature_face_set, boundary_loops, keep_feature, cap_loops=True
+):
     """Build a closed bmesh from *obj.data* containing either the feature
     half (*keep_feature=True*) or the rest (*keep_feature=False*).
 
@@ -1892,10 +1894,14 @@ def split_by_feature_faces(obj, feature_face_set, boundary_loops, keep_feature):
     so the split is confined to the boundary loop and never leaks into
     unrelated parts of the mesh.
 
-    Each boundary loop is closed with one cap face. If the caller has
-    already snapped the boundary verts onto a common plane, the foot's
-    cap and the body's cap coincide exactly and both halves share a
-    matching flat interface.
+    When *cap_loops* is True, each boundary loop is closed with one cap
+    face.  If the caller has already snapped the boundary verts onto a
+    common plane, the foot's cap and the body's cap coincide exactly and
+    both halves share a matching flat interface.
+
+    Callers that want to follow up with an infinite-plane bisect should
+    pass ``cap_loops=False``; a pre-existing cap would overlap with the
+    new edges the bisect creates on the plane.
     """
     me = obj.data
     bm = bmesh.new()
@@ -1918,14 +1924,15 @@ def split_by_feature_faces(obj, feature_face_set, boundary_loops, keep_feature):
     # Cap each boundary loop. The two halves need opposite winding so
     # each cap's outward normal points away from its own volume; we
     # flip for the body side and let recalc_face_normals sort any drift.
-    for loop in boundary_loops:
-        cap_verts = [bm.verts[vi] for vi in loop]
-        if not keep_feature:
-            cap_verts = list(reversed(cap_verts))
-        try:
-            bm.faces.new(cap_verts)
-        except ValueError:
-            pass
+    if cap_loops:
+        for loop in boundary_loops:
+            cap_verts = [bm.verts[vi] for vi in loop]
+            if not keep_feature:
+                cap_verts = list(reversed(cap_verts))
+            try:
+                bm.faces.new(cap_verts)
+            except ValueError:
+                pass
 
     orphans = [v for v in bm.verts if not v.link_faces]
     if orphans:
@@ -2485,7 +2492,68 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             selected_faces_set,
                             boundary_loops,
                             keep_feature=True,
+                            cap_loops=False,
                         )
+
+                        # Infinite-plane cleanup: the feature faces can
+                        # contain interior verts that sit *past* the
+                        # best-fit plane (the small part's would-be flat
+                        # bottom). Those overhangs stop the part from
+                        # sitting flat on a printer plate. Cut the foot
+                        # with the same plane and throw away whichever
+                        # side has fewer verts — that's the thin sliver
+                        # of overhang; the bulk of the foot survives.
+                        # Picking the keep-side from geometry rather
+                        # than dir_vec handles both connector directions
+                        # (the user can pick either, and only the sign
+                        # of the preferred normal flips with them).
+                        local_plane_co = world_inv @ plane_co
+                        local_plane_no = (
+                            world_mat.to_3x3().transposed() @ plane_normal
+                        ).normalized()
+
+                        pos = neg = 0
+                        for v in foot_bm.verts:
+                            s = local_plane_no.dot(v.co - local_plane_co)
+                            if s > 1e-6:
+                                pos += 1
+                            elif s < -1e-6:
+                                neg += 1
+                        if neg > pos:
+                            local_plane_no = -local_plane_no
+
+                        geom = (
+                            foot_bm.verts[:]
+                            + foot_bm.edges[:]
+                            + foot_bm.faces[:]
+                        )
+                        bmesh.ops.bisect_plane(
+                            foot_bm,
+                            geom=geom,
+                            plane_co=local_plane_co,
+                            plane_no=local_plane_no,
+                            clear_outer=False,
+                            clear_inner=True,
+                        )
+
+                        open_edges = [
+                            e for e in foot_bm.edges if len(e.link_faces) == 1
+                        ]
+                        if open_edges:
+                            bmesh.ops.contextual_create(
+                                foot_bm, geom=open_edges
+                            )
+                        foot_orphans = [
+                            v for v in foot_bm.verts if not v.link_faces
+                        ]
+                        if foot_orphans:
+                            bmesh.ops.delete(
+                                foot_bm, geom=foot_orphans, context="VERTS"
+                            )
+                        bmesh.ops.recalc_face_normals(
+                            foot_bm, faces=foot_bm.faces[:]
+                        )
+
                         foot_mesh = bpy.data.meshes.new("Connector")
                         foot_bm.to_mesh(foot_mesh)
                         foot_bm.free()
