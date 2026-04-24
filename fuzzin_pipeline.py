@@ -846,7 +846,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             "pocket. The boundary loop is offset outward by this amount in "
             "the cut plane before the pocket is subtracted from the body"
         ),
-        default=0.2,
+        default=0.4,
         min=0.0,
         soft_max=2.0,
         precision=2,
@@ -1866,9 +1866,7 @@ def fit_best_plane(points, preferred_normal=None):
     as needed so it lies in the same hemisphere (positive dot product).
     """
     n = len(points)
-    fallback = (
-        preferred_normal.normalized() if preferred_normal else Vector((0, 0, 1))
-    )
+    fallback = preferred_normal.normalized() if preferred_normal else Vector((0, 0, 1))
     if n == 0:
         return Vector((0, 0, 0)), fallback
 
@@ -1891,11 +1889,10 @@ def fit_best_plane(points, preferred_normal=None):
         zz += d.z * d.z
 
     import numpy as _np
+
     cov = _np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
     _, eigvecs = _np.linalg.eigh(cov)
-    nrm = Vector(
-        (float(eigvecs[0, 0]), float(eigvecs[1, 0]), float(eigvecs[2, 0]))
-    )
+    nrm = Vector((float(eigvecs[0, 0]), float(eigvecs[1, 0]), float(eigvecs[2, 0])))
 
     if nrm.length < 1e-9:
         nrm = fallback
@@ -1992,9 +1989,7 @@ def build_straight_cut_body_cleanup_bm(
     # Orthonormal basis (u, v) in the cut plane, used to resolve the
     # 2D outward direction for each loop vertex.
     ref = (
-        Vector((0, 0, 1))
-        if abs(plane_no_away_from_body.z) < 0.9
-        else Vector((1, 0, 0))
+        Vector((0, 0, 1)) if abs(plane_no_away_from_body.z) < 0.9 else Vector((1, 0, 0))
     )
     u_axis = plane_no_away_from_body.cross(ref).normalized()
     v_axis = plane_no_away_from_body.cross(u_axis).normalized()
@@ -2012,10 +2007,7 @@ def build_straight_cut_body_cleanup_bm(
             prev_p = loop[(i - 1) % n]
             next_p = loop[(i + 1) % n]
             tang = next_p - prev_p
-            tang = (
-                tang
-                - plane_no_away_from_body * plane_no_away_from_body.dot(tang)
-            )
+            tang = tang - plane_no_away_from_body * plane_no_away_from_body.dot(tang)
             nrm = plane_no_away_from_body.cross(tang)
             if nrm.length < 1e-9:
                 outward.append(Vector((0, 0, 0)))
@@ -2644,11 +2636,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         if neg > pos:
                             local_plane_no = -local_plane_no
 
-                        geom = (
-                            foot_bm.verts[:]
-                            + foot_bm.edges[:]
-                            + foot_bm.faces[:]
-                        )
+                        geom = foot_bm.verts[:] + foot_bm.edges[:] + foot_bm.faces[:]
                         bmesh.ops.bisect_plane(
                             foot_bm,
                             geom=geom,
@@ -2662,19 +2650,13 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             e for e in foot_bm.edges if len(e.link_faces) == 1
                         ]
                         if open_edges:
-                            bmesh.ops.contextual_create(
-                                foot_bm, geom=open_edges
-                            )
-                        foot_orphans = [
-                            v for v in foot_bm.verts if not v.link_faces
-                        ]
+                            bmesh.ops.contextual_create(foot_bm, geom=open_edges)
+                        foot_orphans = [v for v in foot_bm.verts if not v.link_faces]
                         if foot_orphans:
                             bmesh.ops.delete(
                                 foot_bm, geom=foot_orphans, context="VERTS"
                             )
-                        bmesh.ops.recalc_face_normals(
-                            foot_bm, faces=foot_bm.faces[:]
-                        )
+                        bmesh.ops.recalc_face_normals(foot_bm, faces=foot_bm.faces[:])
 
                         foot_mesh = bpy.data.meshes.new("Connector")
                         foot_bm.to_mesh(foot_mesh)
@@ -2709,17 +2691,13 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                                 off_clr,
                                 dep_clr,
                             )
-                            cleanup_mesh = bpy.data.meshes.new(
-                                "_StraightCleanup"
-                            )
+                            cleanup_mesh = bpy.data.meshes.new("_StraightCleanup")
                             cleanup_bm.to_mesh(cleanup_mesh)
                             cleanup_bm.free()
                             cleanup_obj = bpy.data.objects.new(
                                 "_StraightCleanup", cleanup_mesh
                             )
-                            cleanup_obj.matrix_world = (
-                                obj.matrix_world.copy()
-                            )
+                            cleanup_obj.matrix_world = obj.matrix_world.copy()
                             context.collection.objects.link(cleanup_obj)
 
                             apply_boolean_difference(
