@@ -839,6 +839,30 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ),
         default=False,
     )
+    connector_straight_offset_clearance: FloatProperty(
+        name="Offset Clearance",
+        description=(
+            "Straight cut only: radial clearance for the body-side cleanup "
+            "pocket. The boundary loop is offset outward by this amount in "
+            "the cut plane before the pocket is subtracted from the body"
+        ),
+        default=0.2,
+        min=0.0,
+        soft_max=2.0,
+        precision=2,
+    )
+    connector_straight_depth_clearance: FloatProperty(
+        name="Depth Clearance",
+        description=(
+            "Straight cut only: depth of the body-side cleanup pocket "
+            "measured into the body from the cut plane. Pulls back any body "
+            "geometry that leans into the plane so the mated foot sits flush"
+        ),
+        default=0.2,
+        min=0.0,
+        soft_max=2.0,
+        precision=2,
+    )
     connector_direction: EnumProperty(
         name="Direction",
         description="Direction to extrude the feature connector",
@@ -1942,6 +1966,91 @@ def split_by_feature_faces(
     return bm
 
 
+def build_straight_cut_body_cleanup_bm(
+    loop_positions, plane_no_into_body, offset_clearance, depth_clearance
+):
+    """Build a prism cutter to carve a clearance pocket into the body
+    along a straight-cut plane.
+
+    The prism's front face sits on the cut plane — the loop offset
+    outward (in the plane) by *offset_clearance* — and it extrudes
+    *depth_clearance* into the body along *plane_no_into_body*.
+
+    Boolean-subtracting this from the body gives the mated foot XY slop
+    and pulls back any body geometry that leans into the cut plane,
+    so the interface is genuinely planar on the body side too.
+
+    ``loop_positions``: list of loops, each a list of Vectors on the
+    cut plane (local space, already snapped).
+    ``plane_no_into_body``: unit Vector pointing from the plane into
+    the body (opposite of the foot side).
+    """
+    bm = bmesh.new()
+
+    # Orthonormal basis (u, v) in the cut plane, used to resolve the
+    # 2D outward direction for each loop vertex.
+    ref = (
+        Vector((0, 0, 1))
+        if abs(plane_no_into_body.z) < 0.9
+        else Vector((1, 0, 0))
+    )
+    u_axis = plane_no_into_body.cross(ref).normalized()
+    v_axis = plane_no_into_body.cross(u_axis).normalized()
+
+    for loop in loop_positions:
+        n = len(loop)
+        if n < 3:
+            continue
+
+        cu = sum(u_axis.dot(p) for p in loop) / n
+        cv = sum(v_axis.dot(p) for p in loop) / n
+
+        outward = []
+        for i in range(n):
+            prev_p = loop[(i - 1) % n]
+            next_p = loop[(i + 1) % n]
+            tang = next_p - prev_p
+            tang = tang - plane_no_into_body * plane_no_into_body.dot(tang)
+            nrm = plane_no_into_body.cross(tang)
+            if nrm.length < 1e-9:
+                outward.append(Vector((0, 0, 0)))
+                continue
+            nrm.normalize()
+            cu_off = u_axis.dot(loop[i]) - cu
+            cv_off = v_axis.dot(loop[i]) - cv
+            if u_axis.dot(nrm) * cu_off + v_axis.dot(nrm) * cv_off < 0:
+                nrm = -nrm
+            outward.append(nrm)
+
+        front_verts = []
+        back_verts = []
+        for i, p in enumerate(loop):
+            front_co = p + outward[i] * offset_clearance
+            back_co = front_co + plane_no_into_body * depth_clearance
+            front_verts.append(bm.verts.new(front_co))
+            back_verts.append(bm.verts.new(back_co))
+
+        try:
+            bm.faces.new(front_verts)
+        except ValueError:
+            pass
+        try:
+            bm.faces.new(list(reversed(back_verts)))
+        except ValueError:
+            pass
+        for i in range(n):
+            j = (i + 1) % n
+            try:
+                bm.faces.new(
+                    [front_verts[i], back_verts[i], back_verts[j], front_verts[j]]
+                )
+            except ValueError:
+                pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm
+
+
 # ===========================================================================
 # YZ-Plane Offset Cutter (Boolean step)
 # ===========================================================================
@@ -2487,6 +2596,14 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             obj.data.vertices[vi].co = world_inv @ snapped
                         obj.data.update()
 
+                        # Capture boundary loop positions in local space
+                        # now, while indices still map into obj.data.
+                        # body_bm.to_mesh(obj.data) below re-keys verts.
+                        boundary_loops_local = [
+                            [obj.data.vertices[vi].co.copy() for vi in loop]
+                            for loop in boundary_loops
+                        ]
+
                         foot_bm = split_by_feature_faces(
                             obj,
                             selected_faces_set,
@@ -2566,6 +2683,46 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         )
                         body_bm.to_mesh(obj.data)
                         body_bm.free()
+
+                        # Body-side cleanup: boolean-subtract a shallow
+                        # prism built by offsetting the boundary loop
+                        # outward and extruding it into the body. This
+                        # carves clearance around the foot's perimeter
+                        # and pulls back any body geometry that leaned
+                        # past the cut plane, so the body's interface
+                        # is truly planar. local_plane_no was flipped
+                        # above to point toward the foot; negating it
+                        # gives the direction into the body.
+                        off_clr = props.connector_straight_offset_clearance
+                        dep_clr = props.connector_straight_depth_clearance
+                        if off_clr > 1e-6 or dep_clr > 1e-6:
+                            body_dir = -local_plane_no
+                            cleanup_bm = build_straight_cut_body_cleanup_bm(
+                                boundary_loops_local,
+                                body_dir,
+                                off_clr,
+                                dep_clr,
+                            )
+                            cleanup_mesh = bpy.data.meshes.new(
+                                "_StraightCleanup"
+                            )
+                            cleanup_bm.to_mesh(cleanup_mesh)
+                            cleanup_bm.free()
+                            cleanup_obj = bpy.data.objects.new(
+                                "_StraightCleanup", cleanup_mesh
+                            )
+                            cleanup_obj.matrix_world = (
+                                obj.matrix_world.copy()
+                            )
+                            context.collection.objects.link(cleanup_obj)
+
+                            apply_boolean_difference(
+                                context,
+                                obj,
+                                cleanup_obj,
+                                props.connector_solver,
+                                self.report,
+                            )
 
                         conn_obj = bpy.data.objects.new("Connector", foot_mesh)
                         conn_obj.matrix_world = obj.matrix_world.copy()
@@ -2967,6 +3124,11 @@ class CPIPE_PT_main(bpy.types.Panel):
             col = box.column(align=True)
             col.prop(props, "connector_direction")
             col.prop(props, "connector_straight_cut_enabled")
+
+            straight_col = col.column(align=True)
+            straight_col.enabled = props.connector_straight_cut_enabled
+            straight_col.prop(props, "connector_straight_offset_clearance")
+            straight_col.prop(props, "connector_straight_depth_clearance")
 
             extrude_col = col.column(align=True)
             extrude_col.enabled = not props.connector_straight_cut_enabled
