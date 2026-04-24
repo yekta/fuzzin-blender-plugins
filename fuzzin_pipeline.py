@@ -2310,6 +2310,16 @@ def _remove_mesh_object(obj):
         bpy.data.meshes.remove(mesh)
 
 
+def _average_signed_distance_to_plane(obj, plane_co, plane_no):
+    """Return average signed local-space distance from obj verts to a plane."""
+    if not obj.data.vertices:
+        return 0.0
+    total = 0.0
+    for v in obj.data.vertices:
+        total += plane_no.dot(v.co - plane_co)
+    return total / len(obj.data.vertices)
+
+
 # ===========================================================================
 # YZ-Plane Offset Cutter (Boolean step)
 # ===========================================================================
@@ -2459,6 +2469,9 @@ def apply_boolean_operation(
         if report_fn:
             report_fn({"WARNING"}, f"Boolean issue: {e}")
         success = False
+        failed_mod = target_obj.modifiers.get(bool_mod.name)
+        if failed_mod is not None:
+            target_obj.modifiers.remove(failed_mod)
 
     if remove_operand:
         _remove_mesh_object(operand_obj)
@@ -2480,6 +2493,46 @@ def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=
         report_fn=report_fn,
         remove_operand=True,
     )
+
+
+def apply_boolean_difference_with_exact_fallback(
+    context, target_obj, cutter_obj, solver, report_fn=None
+):
+    """Apply DIFFERENCE and retry with Exact if the first solver is a no-op."""
+    before = (len(target_obj.data.vertices), len(target_obj.data.polygons))
+
+    ok = apply_boolean_operation(
+        context,
+        target_obj,
+        cutter_obj,
+        solver,
+        operation="DIFFERENCE",
+        report_fn=report_fn,
+        remove_operand=False,
+    )
+    after = (len(target_obj.data.vertices), len(target_obj.data.polygons))
+
+    if (not ok or after == before) and solver != "EXACT":
+        ok = apply_boolean_operation(
+            context,
+            target_obj,
+            cutter_obj,
+            "EXACT",
+            operation="DIFFERENCE",
+            report_fn=report_fn,
+            remove_operand=False,
+        )
+        after = (len(target_obj.data.vertices), len(target_obj.data.polygons))
+
+    _remove_mesh_object(cutter_obj)
+
+    if after == before and report_fn:
+        report_fn(
+            {"WARNING"},
+            "Female socket boolean did not change the connector. Check peg placement/solver.",
+        )
+
+    return ok and after != before
 
 
 # ===========================================================================
@@ -2997,9 +3050,19 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         conn_obj = bpy.data.objects.new("Connector", foot_mesh)
                         conn_obj.matrix_world = obj.matrix_world.copy()
                         context.collection.objects.link(conn_obj)
+                        context.view_layer.update()
+
+                        peg_axis = local_plane_no.copy()
+                        if (
+                            _average_signed_distance_to_plane(
+                                conn_obj, local_plane_co, peg_axis
+                            )
+                            < 0.0
+                        ):
+                            peg_axis = -peg_axis
 
                         peg_center = _largest_loop_centroid(
-                            boundary_loops_local, local_plane_no
+                            boundary_loops_local, peg_axis
                         )
                         world_up_local = world_inv.to_3x3() @ Vector((0, 0, 1))
                         peg_width = props.connector_straight_peg_width
@@ -3012,7 +3075,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                         protrusion_bm = build_rotated_rect_prism_bm(
                             peg_center,
-                            local_plane_no,
+                            peg_axis,
                             peg_width,
                             peg_height,
                             -back_span,
@@ -3022,7 +3085,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         _clip_bmesh_by_plane(
                             protrusion_bm,
                             local_plane_co,
-                            local_plane_no,
+                            peg_axis,
                             keep_positive=True,
                         )
                         _append_bmesh(peg_bm, protrusion_bm)
@@ -3052,7 +3115,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         female_overlap = max(back_span, 0.05, peg_clearance)
                         female_bm = build_rotated_rect_prism_bm(
                             peg_center,
-                            local_plane_no,
+                            peg_axis,
                             peg_width,
                             peg_height,
                             -female_overlap,
@@ -3066,7 +3129,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             female_bm,
                             conn_obj.matrix_world,
                         )
-                        female_ok = apply_boolean_difference(
+                        female_ok = apply_boolean_difference_with_exact_fallback(
                             context,
                             conn_obj,
                             female_obj,
