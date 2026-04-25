@@ -888,6 +888,18 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=50.0,
         precision=2,
     )
+    connector_straight_peg_angle: FloatProperty(
+        name="Peg Angle (deg)",
+        description=(
+            "Straight cut only: male/female peg tilt angle measured from "
+            "the horizontal plane. 45 degrees preserves the previous behavior"
+        ),
+        default=45.0,
+        min=0.0,
+        max=90.0,
+        step=100,
+        precision=1,
+    )
     connector_direction: EnumProperty(
         name="Direction",
         description="Direction to extrude the feature connector",
@@ -2147,13 +2159,14 @@ def _largest_loop_centroid(loop_positions, plane_no):
 
 
 def _straight_peg_basis(cut_axis, world_up_local=None, angle_rad=math.pi / 4.0):
-    """Return prism axes for a peg tilted 45 degrees to the XY plane.
+    """Return prism axes for a peg tilted by *angle_rad* to the XY plane.
 
     Local X/depth is the tilted connector axis, local Y/width is the rotation
     axis, and local Z/height is perpendicular to both.  This is equivalent to
     taking a horizontal rectangular prism and rotating it around its Y axis.
     """
     cut_axis = cut_axis.normalized() if cut_axis.length > 1e-9 else Vector((1, 0, 0))
+    angle_rad = max(0.0, min(math.pi / 2.0, angle_rad))
 
     ref = (
         world_up_local.normalized()
@@ -2211,9 +2224,10 @@ def build_rotated_rect_prism_bm(
     start_offset,
     end_offset,
     world_up_local=None,
+    angle_rad=math.pi / 4.0,
     clearance=0.0,
 ):
-    """Build a rectangular prism tilted 45 degrees against the XY plane.
+    """Build a rectangular prism tilted by *angle_rad* against the XY plane.
 
     *start_offset* and *end_offset* are measured from *center* along the
     tilted local X/depth axis. Positive offsets point from the body side
@@ -2232,7 +2246,9 @@ def build_rotated_rect_prism_bm(
     if half_w <= 1e-9 or half_h <= 1e-9:
         return bm
 
-    depth_axis, width_axis, height_axis = _straight_peg_basis(cut_axis, world_up_local)
+    depth_axis, width_axis, height_axis = _straight_peg_basis(
+        cut_axis, world_up_local, angle_rad
+    )
 
     def make_ring(t):
         c = center + depth_axis * t
@@ -3136,6 +3152,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         peg_width = props.connector_straight_peg_width
                         peg_height = props.connector_straight_peg_height
                         peg_protrusion = props.connector_straight_peg_protrusion
+                        peg_angle_rad = math.radians(props.connector_straight_peg_angle)
                         peg_clearance = props.connector_clearance
                         back_span = max(peg_height + peg_clearance + 0.1, 0.1)
 
@@ -3149,6 +3166,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             -back_span,
                             peg_protrusion,
                             world_up_local=world_up_local,
+                            angle_rad=peg_angle_rad,
                         )
                         # Keep a tiny amount of peg volume inside the body.
                         # If the peg starts exactly on the cut plane it only
@@ -3200,6 +3218,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             -female_overlap,
                             peg_protrusion + peg_clearance,
                             world_up_local=world_up_local,
+                            angle_rad=peg_angle_rad,
                             clearance=peg_clearance,
                         )
                         female_obj = _mesh_object_from_bmesh(
@@ -3406,6 +3425,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         f", peg {props.connector_straight_peg_width:.1f} x "
                         f"{props.connector_straight_peg_height:.1f} mm"
                         f", {props.connector_straight_peg_protrusion:.1f} mm protrusion"
+                        f", {props.connector_straight_peg_angle:.1f}° angle"
                         f", {props.connector_clearance:.2f} mm clearance"
                     )
                 parts.append(
@@ -3633,6 +3653,7 @@ class CPIPE_PT_main(bpy.types.Panel):
             straight_col.prop(props, "connector_straight_offset_clearance")
             straight_col.prop(props, "connector_straight_depth_clearance")
             straight_col.separator()
+            straight_col.prop(props, "connector_straight_peg_angle")
             straight_col.prop(props, "connector_straight_peg_width")
             straight_col.prop(props, "connector_straight_peg_height")
             straight_col.prop(props, "connector_straight_peg_protrusion")
