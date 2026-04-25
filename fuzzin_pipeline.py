@@ -840,6 +840,23 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ),
         default=False,
     )
+    connector_straight_peg_enabled: BoolProperty(
+        name="Peg",
+        description=(
+            "Straight cut only: add a matched male peg and female socket. "
+            "Disable for a plain straight cut with no registration peg"
+        ),
+        default=True,
+    )
+    connector_straight_male_side: EnumProperty(
+        name="Male Side",
+        description="Straight cut only: object that receives the protruding male peg",
+        items=[
+            ("PART", "Part", "Put the male peg on the separated part"),
+            ("BODY", "Body", "Put the male peg on the remaining body"),
+        ],
+        default="PART",
+    )
     connector_straight_offset_clearance: FloatProperty(
         name="Offset Clearance",
         description=(
@@ -882,7 +899,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     )
     connector_straight_peg_protrusion: FloatProperty(
         name="Peg Protrusion",
-        description="Straight cut only: male peg protrusion from the cut plane into the smaller part",
+        description="Straight cut only: male peg protrusion from the cut plane into the socket side",
         default=2.5,
         min=0.01,
         soft_max=50.0,
@@ -3136,108 +3153,119 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         context.collection.objects.link(conn_obj)
                         context.view_layer.update()
 
-                        peg_axis = local_plane_no.copy()
-                        if (
-                            _average_signed_distance_to_plane(
-                                conn_obj, local_plane_co, peg_axis
+                        if props.connector_straight_peg_enabled:
+                            part_axis = local_plane_no.copy()
+                            if (
+                                _average_signed_distance_to_plane(
+                                    conn_obj, local_plane_co, part_axis
+                                )
+                                < 0.0
+                            ):
+                                part_axis = -part_axis
+
+                            male_on_body = props.connector_straight_male_side == "BODY"
+                            peg_axis = part_axis if male_on_body else -part_axis
+                            male_target = obj if male_on_body else conn_obj
+                            female_target = conn_obj if male_on_body else obj
+
+                            peg_center = _largest_loop_centroid(
+                                boundary_loops_local, peg_axis
                             )
-                            < 0.0
-                        ):
-                            peg_axis = -peg_axis
-
-                        peg_center = _largest_loop_centroid(
-                            boundary_loops_local, peg_axis
-                        )
-                        world_up_local = world_inv.to_3x3() @ Vector((0, 0, 1))
-                        peg_width = props.connector_straight_peg_width
-                        peg_height = props.connector_straight_peg_height
-                        peg_protrusion = props.connector_straight_peg_protrusion
-                        peg_angle_rad = math.radians(props.connector_straight_peg_angle)
-                        peg_clearance = props.connector_clearance
-                        back_span = max(peg_height + peg_clearance + 0.1, 0.1)
-
-                        peg_bm = bmesh.new()
-
-                        protrusion_bm = build_rotated_rect_prism_bm(
-                            peg_center,
-                            peg_axis,
-                            peg_width,
-                            peg_height,
-                            -back_span,
-                            peg_protrusion,
-                            world_up_local=world_up_local,
-                            angle_rad=peg_angle_rad,
-                        )
-                        # Keep a tiny amount of peg volume inside the body.
-                        # If the peg starts exactly on the cut plane it only
-                        # touches the body's cap face, so Manifold can treat
-                        # the union as a no-op and Exact may leave coplanar
-                        # artifacts at the interface.
-                        peg_join_plane = (
-                            local_plane_co
-                            - peg_axis.normalized() * _STRAIGHT_PEG_BOOLEAN_OVERLAP
-                        )
-                        _clip_bmesh_by_plane(
-                            protrusion_bm,
-                            peg_join_plane,
-                            peg_axis,
-                            keep_positive=True,
-                        )
-                        _append_bmesh(peg_bm, protrusion_bm)
-                        protrusion_bm.free()
-
-                        male_ok = False
-                        if len(peg_bm.faces) > 0:
-                            bmesh.ops.recalc_face_normals(peg_bm, faces=peg_bm.faces[:])
-                            peg_obj = _mesh_object_from_bmesh(
-                                context,
-                                "_StraightPeg",
-                                peg_bm,
-                                obj.matrix_world,
+                            world_up_local = world_inv.to_3x3() @ Vector((0, 0, 1))
+                            peg_width = props.connector_straight_peg_width
+                            peg_height = props.connector_straight_peg_height
+                            peg_protrusion = props.connector_straight_peg_protrusion
+                            peg_angle_rad = math.radians(
+                                props.connector_straight_peg_angle
                             )
-                            male_ok = apply_boolean_operation(
+                            peg_clearance = props.connector_clearance
+                            back_span = max(peg_height + peg_clearance + 0.1, 0.1)
+
+                            peg_bm = bmesh.new()
+
+                            protrusion_bm = build_rotated_rect_prism_bm(
+                                peg_center,
+                                peg_axis,
+                                peg_width,
+                                peg_height,
+                                -back_span,
+                                peg_protrusion,
+                                world_up_local=world_up_local,
+                                angle_rad=peg_angle_rad,
+                            )
+                            # Keep a tiny amount of peg volume inside the
+                            # object that owns the male side.
+                            # If the peg starts exactly on the cut plane it only
+                            # touches the cap face, so Manifold can treat
+                            # the union as a no-op and Exact may leave coplanar
+                            # artifacts at the interface.
+                            peg_join_plane = (
+                                local_plane_co
+                                - peg_axis.normalized() * _STRAIGHT_PEG_BOOLEAN_OVERLAP
+                            )
+                            _clip_bmesh_by_plane(
+                                protrusion_bm,
+                                peg_join_plane,
+                                peg_axis,
+                                keep_positive=True,
+                            )
+                            _append_bmesh(peg_bm, protrusion_bm)
+                            protrusion_bm.free()
+
+                            male_ok = False
+                            if len(peg_bm.faces) > 0:
+                                bmesh.ops.recalc_face_normals(
+                                    peg_bm, faces=peg_bm.faces[:]
+                                )
+                                peg_obj = _mesh_object_from_bmesh(
+                                    context,
+                                    "_StraightPeg",
+                                    peg_bm,
+                                    male_target.matrix_world,
+                                )
+                                male_ok = apply_boolean_operation(
+                                    context,
+                                    male_target,
+                                    peg_obj,
+                                    props.connector_solver,
+                                    operation="UNION",
+                                    report_fn=self.report,
+                                    remove_operand=True,
+                                    exact_self_intersection=exact_self,
+                                    exact_hole_tolerant=exact_hole,
+                                )
+                            else:
+                                peg_bm.free()
+
+                            female_overlap = max(back_span, 0.05, peg_clearance)
+                            female_bm = build_rotated_rect_prism_bm(
+                                peg_center,
+                                peg_axis,
+                                peg_width,
+                                peg_height,
+                                -female_overlap,
+                                peg_protrusion + peg_clearance,
+                                world_up_local=world_up_local,
+                                angle_rad=peg_angle_rad,
+                                clearance=peg_clearance,
+                            )
+                            female_obj = _mesh_object_from_bmesh(
                                 context,
-                                obj,
-                                peg_obj,
+                                "_StraightPegSocket",
+                                female_bm,
+                                female_target.matrix_world,
+                            )
+                            female_ok = apply_boolean_difference_with_exact_fallback(
+                                context,
+                                female_target,
+                                female_obj,
                                 props.connector_solver,
-                                operation="UNION",
-                                report_fn=self.report,
-                                remove_operand=True,
+                                self.report,
                                 exact_self_intersection=exact_self,
                                 exact_hole_tolerant=exact_hole,
                             )
-                        else:
-                            peg_bm.free()
 
-                        female_overlap = max(back_span, 0.05, peg_clearance)
-                        female_bm = build_rotated_rect_prism_bm(
-                            peg_center,
-                            peg_axis,
-                            peg_width,
-                            peg_height,
-                            -female_overlap,
-                            peg_protrusion + peg_clearance,
-                            world_up_local=world_up_local,
-                            angle_rad=peg_angle_rad,
-                            clearance=peg_clearance,
-                        )
-                        female_obj = _mesh_object_from_bmesh(
-                            context,
-                            "_StraightPegSocket",
-                            female_bm,
-                            conn_obj.matrix_world,
-                        )
-                        female_ok = apply_boolean_difference_with_exact_fallback(
-                            context,
-                            conn_obj,
-                            female_obj,
-                            props.connector_solver,
-                            self.report,
-                            exact_self_intersection=exact_self,
-                            exact_hole_tolerant=exact_hole,
-                        )
-
-                        did_straight_peg = male_ok and female_ok
+                            did_straight_peg = male_ok and female_ok
 
                         bpy.ops.object.select_all(action="DESELECT")
                         conn_obj.select_set(True)
@@ -3425,6 +3453,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         f", peg {props.connector_straight_peg_width:.1f} x "
                         f"{props.connector_straight_peg_height:.1f} mm"
                         f", {props.connector_straight_peg_protrusion:.1f} mm protrusion"
+                        f", male on {props.connector_straight_male_side.lower()}"
                         f", {props.connector_straight_peg_angle:.1f}° angle"
                         f", {props.connector_clearance:.2f} mm clearance"
                     )
@@ -3653,11 +3682,15 @@ class CPIPE_PT_main(bpy.types.Panel):
             straight_col.prop(props, "connector_straight_offset_clearance")
             straight_col.prop(props, "connector_straight_depth_clearance")
             straight_col.separator()
-            straight_col.prop(props, "connector_straight_peg_angle")
-            straight_col.prop(props, "connector_straight_peg_width")
-            straight_col.prop(props, "connector_straight_peg_height")
-            straight_col.prop(props, "connector_straight_peg_protrusion")
-            straight_col.prop(props, "connector_clearance", text="Female Clearance")
+            straight_col.prop(props, "connector_straight_peg_enabled")
+            peg_col = straight_col.column(align=True)
+            peg_col.enabled = props.connector_straight_peg_enabled
+            peg_col.prop(props, "connector_straight_male_side")
+            peg_col.prop(props, "connector_straight_peg_angle")
+            peg_col.prop(props, "connector_straight_peg_width")
+            peg_col.prop(props, "connector_straight_peg_height")
+            peg_col.prop(props, "connector_straight_peg_protrusion")
+            peg_col.prop(props, "connector_clearance", text="Female Clearance")
 
             extrude_col = col.column(align=True)
             extrude_col.enabled = not props.connector_straight_cut_enabled
