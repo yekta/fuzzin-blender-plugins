@@ -440,6 +440,71 @@ def create_tmark_cutter_bm(side="LEFT"):
     return bm
 
 
+# Dot-mode dimensions (mm)
+_DOT_DIAMETER = 1.2  # circle diameter
+_DOT_GAP = 0.6  # gap between perimeters of the two right-side dots
+_DOT_SEGMENTS = 48  # circle tessellation
+
+
+def _dot_centers(side="LEFT"):
+    """Return the (y, z) centres of the dots on the cutter profile plane.
+
+    LEFT  – one dot at the origin.
+    RIGHT – two dots on a 45° diagonal, with *_DOT_GAP* between perimeters.
+            Centre-to-centre distance = diameter + gap. The pair is centred
+            at (0, 0) so the mark sits on the same point as the L variant.
+    """
+    if side == "LEFT":
+        return [(0.0, 0.0)]
+    center_dist = _DOT_DIAMETER + _DOT_GAP
+    half = center_dist / 2.0
+    diag = half / math.sqrt(2.0)
+    return [(-diag, -diag), (diag, diag)]
+
+
+def create_dot_cutter_bm(side="LEFT"):
+    """Build a bmesh cutter with one (LEFT) or two diagonal (RIGHT) circular
+    dots. Cutter extends along +X like *create_tmark_cutter_bm*."""
+    bm = bmesh.new()
+    overlap = 0.05
+    x_front = -overlap
+    x_back = _TMARK_DEPTH + overlap
+
+    radius = _DOT_DIAMETER / 2.0
+    for cy, cz in _dot_centers(side):
+        front_verts = []
+        back_verts = []
+        for i in range(_DOT_SEGMENTS):
+            theta = 2.0 * math.pi * i / _DOT_SEGMENTS
+            y = cy + radius * math.cos(theta)
+            z = cz + radius * math.sin(theta)
+            front_verts.append(bm.verts.new(Vector((x_front, y, z))))
+            back_verts.append(bm.verts.new(Vector((x_back, y, z))))
+
+        bm.verts.ensure_lookup_table()
+
+        try:
+            bm.faces.new(front_verts)
+        except ValueError:
+            pass
+        try:
+            bm.faces.new(list(reversed(back_verts)))
+        except ValueError:
+            pass
+
+        for i in range(_DOT_SEGMENTS):
+            j = (i + 1) % _DOT_SEGMENTS
+            try:
+                bm.faces.new(
+                    [front_verts[i], front_verts[j], back_verts[j], back_verts[i]]
+                )
+            except ValueError:
+                pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm
+
+
 def _mark_rotation_matrix(direction):
     """Return a 4×4 rotation matrix that transforms the default cutter
     orientation (profile on YZ, extending +X) to cut inward from the
@@ -475,6 +540,57 @@ def _mark_rotation_matrix(direction):
         @ Matrix.Rotation(-pi / 2, 4, "Z"),
     }
     return rotations.get(direction, Matrix.Identity(4))
+
+
+def _rotation_for_inward_direction(inward_dir):
+    """Build a 4×4 rotation that maps the cutter's local axes onto the world
+    so cutter local +X points along *inward_dir* (into the solid body).
+
+    Cutter local +Z → world Z projected onto the face plane (mark "up"),
+    with a fallback to +Y if the face is too horizontal.
+    Cutter local +Y → derived to keep the basis right-handed.
+    """
+    inward = inward_dir.normalized()
+    world_up = Vector((0, 0, 1))
+    if abs(inward.dot(world_up)) > 0.95:
+        world_up = Vector((0, 1, 0))
+    new_z = (world_up - world_up.dot(inward) * inward).normalized()
+    new_y = new_z.cross(inward).normalized()
+
+    M = Matrix.Identity(4)
+    for i, axis in enumerate((inward, new_y, new_z)):
+        M[0][i] = axis.x
+        M[1][i] = axis.y
+        M[2][i] = axis.z
+    return M
+
+
+def _face_inward_direction(bm, face, world, face_centre_world, face_axis_world):
+    """Determine the inward (into-the-solid) direction for *face* by probing
+    nearby geometry.
+
+    We split all non-face vertices by their signed distance to the face
+    plane and pick the side that holds the bulk of the mesh as "solid".
+    Returns a world-space unit vector pointing from the face centre into
+    the solid body — i.e. the direction the cutter should extrude.
+
+    This is robust to flipped face normals: it relies on geometry, not on
+    the stored winding.
+    """
+    own = {v.index for v in face.verts}
+    axis = face_axis_world.normalized()
+    pos = 0
+    neg = 0
+    for v in bm.verts:
+        if v.index in own:
+            continue
+        d = (world @ v.co - face_centre_world).dot(axis)
+        if d > 1e-6:
+            pos += 1
+        elif d < -1e-6:
+            neg += 1
+    sign = 1.0 if pos >= neg else -1.0
+    return (axis * sign).normalized()
 
 
 def _find_mesh_islands(obj):
@@ -1014,10 +1130,25 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     mark_left_right_enabled: BoolProperty(
         name="Mark Left & Right",
         description=(
-            "Engrave an L or r mark on the back (-X) face of the active "
-            "object to identify left or right parts"
+            "Engrave a left/right mark on the active object. Operates on "
+            "the selected face when one is active in Edit Mode, otherwise "
+            "auto-picks the left-most or right-most body"
         ),
         default=False,
+    )
+    mark_mode: EnumProperty(
+        name="Style",
+        description="Shape of the engraved mark",
+        items=[
+            ("LETTER", "Letter (L / T)", "Capital L for left, capital T for right"),
+            (
+                "DOTS",
+                "Dots",
+                "1 dot for left; 2 dots on a 45° diagonal for right "
+                f"({_DOT_DIAMETER:.1f} mm diameter, {_DOT_GAP:.1f} mm gap between perimeters)",
+            ),
+        ],
+        default="LETTER",
     )
     mark_offset_x: FloatProperty(
         name="X Offset (mm)",
@@ -1420,9 +1551,10 @@ class CPIPE_OT_feature_select(bpy.types.Operator):
 
 
 class CPIPE_OT_mark_side(bpy.types.Operator):
-    """Engrave an 'L' or 'r' mark on the back face to identify left or right.
-    Auto-detects separate bodies: the left-most body (lowest Y centroid)
-    gets the L mark, the right-most body gets the r mark."""
+    """Engrave a left/right mark.
+    If a single face is selected in Edit Mode, the mark is placed on that
+    face. Otherwise, separate bodies are auto-detected: the left-most body
+    (lowest Y centroid) gets the LEFT mark, the right-most gets RIGHT."""
 
     bl_idname = "cpipe.mark_side"
     bl_label = "Mark Side"
@@ -1431,8 +1563,8 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
     side: EnumProperty(
         name="Side",
         items=[
-            ("LEFT", "Left", "Capital L mark (left part)"),
-            ("RIGHT", "Right", "Capital T mark (right part)"),
+            ("LEFT", "Left", "Left-side mark"),
+            ("RIGHT", "Right", "Right-side mark"),
         ],
         default="LEFT",
     )
@@ -1446,6 +1578,31 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
         obj = context.active_object
         props = context.scene.cpipe
 
+        # ---- Capture an active face selection BEFORE leaving edit mode ----
+        face_centre = None
+        face_rotation = None
+        if obj.mode == "EDIT":
+            bm_edit = bmesh.from_edit_mesh(obj.data)
+            selected_faces = [f for f in bm_edit.faces if f.select]
+            if len(selected_faces) > 1:
+                self.report(
+                    {"WARNING"},
+                    f"{len(selected_faces)} faces selected — select exactly one",
+                )
+                return {"CANCELLED"}
+            if len(selected_faces) == 1:
+                face = selected_faces[0]
+                world = obj.matrix_world
+                normal_mat = world.to_3x3().inverted().transposed()
+                face_centre = world @ face.calc_center_median()
+                face_axis = (normal_mat @ face.normal).normalized()
+                # Probe nearby geometry to find the solid side, ignoring
+                # whatever way face.normal happens to point.
+                inward = _face_inward_direction(
+                    bm_edit, face, world, face_centre, face_axis
+                )
+                face_rotation = _rotation_for_inward_direction(inward)
+
         if obj.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -1454,54 +1611,56 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
             self.report({"WARNING"}, "Mesh has no vertices")
             return {"CANCELLED"}
 
-        # ---- Detect mesh islands ----
-        islands = _find_mesh_islands(obj)
-
-        if len(islands) < 2:
-            # Single body — just mark its back face
-            target_island = set(range(len(me.vertices)))
-            self.report(
-                {"INFO"},
-                "Single body detected — marking its back face",
-            )
+        # ---- Choose placement: selected face takes priority ----
+        if face_centre is not None:
+            rot = face_rotation
+            self.report({"INFO"}, "Marking on the selected face")
         else:
-            # Multiple bodies — sort by Y centroid to determine left/right.
-            # In Blender's default front view (looking down -Y), the screen-
-            # left body has a *lower* Y centroid.  We sort ascending by Y so
-            # index 0 = left-most, index -1 = right-most.
-            islands_sorted = sorted(
-                islands,
-                key=lambda isle: _island_centroid(obj, isle).y,
-            )
-            if self.side == "LEFT":
-                target_island = islands_sorted[-1]
+            islands = _find_mesh_islands(obj)
+            if len(islands) < 2:
+                target_island = set(range(len(me.vertices)))
+                self.report(
+                    {"INFO"},
+                    "Single body detected — marking its back face",
+                )
             else:
-                target_island = islands_sorted[0]
+                # Sort by Y centroid: in default front view (looking down -Y),
+                # the screen-left body has a *lower* Y centroid.
+                islands_sorted = sorted(
+                    islands,
+                    key=lambda isle: _island_centroid(obj, isle).y,
+                )
+                if self.side == "LEFT":
+                    target_island = islands_sorted[-1]
+                else:
+                    target_island = islands_sorted[0]
+                self.report(
+                    {"INFO"},
+                    f"Detected {len(islands)} bodies — targeting "
+                    f"{'left-most' if self.side == 'LEFT' else 'right-most'} "
+                    f"({len(target_island)} verts)",
+                )
+            direction = props.mark_direction
+            face_centre = _island_face_centre(obj, target_island, direction)
+            rot = _mark_rotation_matrix(direction)
 
-            self.report(
-                {"INFO"},
-                f"Detected {len(islands)} bodies — targeting "
-                f"{'left-most' if self.side == 'LEFT' else 'right-most'} "
-                f"({len(target_island)} verts)",
-            )
-
-        # ---- Find face centre of the chosen island ----
-        direction = props.mark_direction
-        face_centre = _island_face_centre(obj, target_island, direction)
-
-        # ---- Build the T-mark cutter ----
-        mark_bm = create_tmark_cutter_bm(side=self.side)
+        # ---- Build the cutter (letter or dots) ----
+        if props.mark_mode == "DOTS":
+            mark_bm = create_dot_cutter_bm(side=self.side)
+            cutter_name = "_DotMarkCutter"
+        else:
+            mark_bm = create_tmark_cutter_bm(side=self.side)
+            cutter_name = "_TMarkCutter"
 
         # Rotate the cutter from default orientation (profile on YZ,
-        # extending +X) to match the chosen direction.
-        rot = _mark_rotation_matrix(direction)
+        # extending +X) to match the chosen face direction.
         bmesh.ops.transform(mark_bm, matrix=rot, verts=mark_bm.verts[:])
 
-        mark_mesh = bpy.data.meshes.new("_TMarkCutter")
+        mark_mesh = bpy.data.meshes.new(cutter_name)
         mark_bm.to_mesh(mark_mesh)
         mark_bm.free()
 
-        mark_obj = bpy.data.objects.new("_TMarkCutter", mark_mesh)
+        mark_obj = bpy.data.objects.new(cutter_name, mark_mesh)
         context.collection.objects.link(mark_obj)
 
         # Offsets are expressed in the face's local frame, where X+ points
@@ -1523,8 +1682,12 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
         ok = apply_boolean_difference(context, obj, mark_obj, solver, self.report)
 
         if ok:
-            label = "Left (L)" if self.side == "LEFT" else "Right (T)"
-            self.report({"INFO"}, f"Marked as {label}")
+            if props.mark_mode == "DOTS":
+                glyph = "1 dot" if self.side == "LEFT" else "2 dots"
+            else:
+                glyph = "L" if self.side == "LEFT" else "T"
+            side_word = "Left" if self.side == "LEFT" else "Right"
+            self.report({"INFO"}, f"Marked as {side_word} ({glyph})")
         else:
             self.report(
                 {"WARNING"},
@@ -3978,17 +4141,41 @@ class CPIPE_PT_main(bpy.types.Panel):
         row = box.row()
         row.prop(props, "mark_left_right_enabled", icon="FONT_DATA")
         if props.mark_left_right_enabled:
-            box.label(
-                text=(
-                    f"{_TMARK_WIDTH:.0f} × {_TMARK_HEIGHT:.0f} × {_TMARK_DEPTH:.1f} mm shape"
-                ),
-                icon="INFO",
-            )
-            box.label(
-                text=(f"{_TMARK_LINE:.1f} mm stroke"),
-                icon="INFO",
-            )
-            if obj and obj.type == "MESH":
+            box.prop(props, "mark_mode", expand=True)
+            if props.mark_mode == "DOTS":
+                box.label(
+                    text=(
+                        f"{_DOT_DIAMETER:.1f} mm dia • "
+                        f"{_DOT_GAP:.1f} mm gap • "
+                        f"{_TMARK_DEPTH:.1f} mm deep"
+                    ),
+                    icon="INFO",
+                )
+            else:
+                box.label(
+                    text=(
+                        f"{_TMARK_WIDTH:.0f} × {_TMARK_HEIGHT:.0f} × "
+                        f"{_TMARK_DEPTH:.1f} mm shape"
+                    ),
+                    icon="INFO",
+                )
+                box.label(
+                    text=(f"{_TMARK_LINE:.1f} mm stroke"),
+                    icon="INFO",
+                )
+            face_selected = False
+            if obj and obj.type == "MESH" and obj.mode == "EDIT":
+                bm_edit = bmesh.from_edit_mesh(obj.data)
+                n_sel = sum(1 for f in bm_edit.faces if f.select)
+                if n_sel == 1:
+                    face_selected = True
+                    box.label(text="Will mark on selected face", icon="FACESEL")
+                elif n_sel > 1:
+                    box.label(
+                        text=f"{n_sel} faces selected — select 1",
+                        icon="ERROR",
+                    )
+            if not face_selected and obj and obj.type == "MESH":
                 islands = _find_mesh_islands(obj)
                 if len(islands) >= 2:
                     box.label(
@@ -4000,7 +4187,9 @@ class CPIPE_PT_main(bpy.types.Panel):
                         text="Single body",
                         icon="MESH_DATA",
                     )
-            box.prop(props, "mark_direction")
+            sub = box.column()
+            sub.enabled = not face_selected
+            sub.prop(props, "mark_direction")
             box.prop(props, "mark_solver")
             col = box.column(align=True)
             col.label(text="Position Offset:")
