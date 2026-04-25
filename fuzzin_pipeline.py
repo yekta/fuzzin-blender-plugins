@@ -1894,6 +1894,8 @@ def build_solid_bmesh(
 # Straight Cut — Best-Fit Plane Bisection
 # ===========================================================================
 
+_STRAIGHT_PEG_BOOLEAN_OVERLAP = 0.05  # mm, hidden inside the body for robust union
+
 
 def fit_best_plane(points, preferred_normal=None):
     """Least-squares best-fit plane through *points* (world space).
@@ -3148,9 +3150,18 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             peg_protrusion,
                             world_up_local=world_up_local,
                         )
+                        # Keep a tiny amount of peg volume inside the body.
+                        # If the peg starts exactly on the cut plane it only
+                        # touches the body's cap face, so Manifold can treat
+                        # the union as a no-op and Exact may leave coplanar
+                        # artifacts at the interface.
+                        peg_join_plane = (
+                            local_plane_co
+                            - peg_axis.normalized() * _STRAIGHT_PEG_BOOLEAN_OVERLAP
+                        )
                         _clip_bmesh_by_plane(
                             protrusion_bm,
-                            local_plane_co,
+                            peg_join_plane,
                             peg_axis,
                             keep_positive=True,
                         )
