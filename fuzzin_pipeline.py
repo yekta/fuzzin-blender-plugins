@@ -1077,6 +1077,69 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         default="MANIFOLD",
     )
 
+    # --- Overhang Shader ---
+    overhang_shader_enabled: BoolProperty(
+        name="Overhang Shader",
+        description=(
+            "Apply a shader that visualises 3D-print overhang severity by "
+            "colouring downward-facing surfaces according to their tilt "
+            "from vertical (the build direction)"
+        ),
+        default=False,
+    )
+    overhang_min_angle: FloatProperty(
+        name="Min Angle (°)",
+        description=(
+            "Surface angle measured from the build plate (horizontal). "
+            "Surfaces tilted below this — closer to a horizontal ceiling — "
+            "are flagged as unprintable. 90° = vertical wall (safe), "
+            "0° = horizontal ceiling (impossible)"
+        ),
+        default=18.0,
+        min=0.0,
+        max=90.0,
+        precision=1,
+    )
+    overhang_warning_angle: FloatProperty(
+        name="Warning Angle (°)",
+        description=(
+            "Surfaces tilted below this (but still above the min angle) are "
+            "marked with the warning colour. Should be greater than the "
+            "min angle"
+        ),
+        default=20.0,
+        min=0.0,
+        max=90.0,
+        precision=1,
+    )
+    overhang_base_color: FloatVectorProperty(
+        name="Base Color",
+        description="Colour for safely printable surfaces",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.05, 0.45, 0.10, 1.0),
+    )
+    overhang_warning_color: FloatVectorProperty(
+        name="Warning Color",
+        description="Colour for surfaces in the warning zone",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 0.95, 0.0, 1.0),
+    )
+    overhang_unprintable_color: FloatVectorProperty(
+        name="Unprintable Color",
+        description="Colour for surfaces tilted beyond the max angle",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.85, 0.05, 0.05, 1.0),
+    )
+
     # --- Export ---
     export_enabled: BoolProperty(
         name="Export STLs",
@@ -2718,6 +2781,184 @@ class CPIPE_OT_boolean(bpy.types.Operator):
 # ===========================================================================
 
 
+# ===========================================================================
+# Overhang Shader
+# ===========================================================================
+
+
+_OVERHANG_MATERIAL_NAME = "Fuzzin_Overhang_Shader"
+
+
+def _set_viewport_shading(context, shading_type):
+    """Switch every visible 3D viewport to *shading_type* (e.g. 'MATERIAL',
+    'SOLID'). No-op for windows without a 3D view."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    space.shading.type = shading_type
+
+
+def build_overhang_material(
+    min_angle_deg,
+    warning_angle_deg,
+    base_color,
+    warning_color,
+    unprintable_color,
+):
+    """Create or update the overhang-visualisation material.
+
+    The angle convention here is the surface tilt measured from the build
+    plate (horizontal): 90° is a vertical wall (safe to print), 0° is a
+    horizontal ceiling (impossible without support).  For a surface with
+    world-space unit normal *n* facing downward (n.z < 0), that tilt is
+        α = arccos(-n.z)
+    so the threshold check ``α < t`` is equivalent to ``-n.z > cos(t)``.
+
+    Surfaces below *min_angle_deg* are flagged unprintable; surfaces between
+    *min_angle_deg* and *warning_angle_deg* get the warning colour.  Top-
+    facing surfaces (n.z >= 0) always stay in the base colour.
+
+    Returns the material datablock.
+    """
+    mat = bpy.data.materials.get(_OVERHANG_MATERIAL_NAME)
+    if mat is None:
+        mat = bpy.data.materials.new(name=_OVERHANG_MATERIAL_NAME)
+    mat.use_nodes = True
+
+    nt = mat.node_tree
+    nodes = nt.nodes
+    links = nt.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    geom = nodes.new("ShaderNodeNewGeometry")
+    geom.location = (-1100, 0)
+
+    sep_xyz = nodes.new("ShaderNodeSeparateXYZ")
+    sep_xyz.location = (-900, 0)
+    links.new(geom.outputs["Normal"], sep_xyz.inputs["Vector"])
+
+    # -normal.z: 1 = ceiling, 0 = vertical wall, negative = upward-facing
+    neg_z = nodes.new("ShaderNodeMath")
+    neg_z.operation = "MULTIPLY"
+    neg_z.inputs[1].default_value = -1.0
+    neg_z.location = (-700, 0)
+    links.new(sep_xyz.outputs["Z"], neg_z.inputs[0])
+
+    # cos(angle) thresholds. Smaller angle → more horizontal → larger cos →
+    # comparisons fire when the surface tilts past the threshold.
+    warn_thresh = max(0.0, min(1.0, math.cos(math.radians(warning_angle_deg))))
+    min_thresh = max(0.0, min(1.0, math.cos(math.radians(min_angle_deg))))
+
+    warn_cmp = nodes.new("ShaderNodeMath")
+    warn_cmp.operation = "GREATER_THAN"
+    warn_cmp.inputs[1].default_value = warn_thresh
+    warn_cmp.location = (-500, 150)
+    links.new(neg_z.outputs[0], warn_cmp.inputs[0])
+
+    min_cmp = nodes.new("ShaderNodeMath")
+    min_cmp.operation = "GREATER_THAN"
+    min_cmp.inputs[1].default_value = min_thresh
+    min_cmp.location = (-500, -150)
+    links.new(neg_z.outputs[0], min_cmp.inputs[0])
+
+    mix_warn = nodes.new("ShaderNodeMixRGB")
+    mix_warn.location = (-280, 150)
+    mix_warn.inputs["Color1"].default_value = base_color
+    mix_warn.inputs["Color2"].default_value = warning_color
+    links.new(warn_cmp.outputs[0], mix_warn.inputs["Fac"])
+
+    mix_min = nodes.new("ShaderNodeMixRGB")
+    mix_min.location = (-60, 0)
+    mix_min.inputs["Color2"].default_value = unprintable_color
+    links.new(mix_warn.outputs["Color"], mix_min.inputs["Color1"])
+    links.new(min_cmp.outputs[0], mix_min.inputs["Fac"])
+
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (180, 0)
+    links.new(mix_min.outputs["Color"], bsdf.inputs["Base Color"])
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.location = (480, 0)
+    links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+
+    return mat
+
+
+class CPIPE_OT_apply_overhang_shader(bpy.types.Operator):
+    """Apply the overhang-visualisation shader to the active mesh"""
+
+    bl_idname = "cpipe.apply_overhang_shader"
+    bl_label = "Apply Overhang Shader"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        props = context.scene.cpipe
+
+        mat = build_overhang_material(
+            min_angle_deg=props.overhang_min_angle,
+            warning_angle_deg=max(
+                props.overhang_warning_angle, props.overhang_min_angle
+            ),
+            base_color=tuple(props.overhang_base_color),
+            warning_color=tuple(props.overhang_warning_color),
+            unprintable_color=tuple(props.overhang_unprintable_color),
+        )
+
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+
+        _set_viewport_shading(context, "MATERIAL")
+
+        self.report(
+            {"INFO"},
+            f"Overhang shader applied (min {props.overhang_min_angle:.0f}°, "
+            f"warn {props.overhang_warning_angle:.0f}°)",
+        )
+        return {"FINISHED"}
+
+
+class CPIPE_OT_clear_overhang_shader(bpy.types.Operator):
+    """Remove the overhang shader from the active mesh"""
+
+    bl_idname = "cpipe.clear_overhang_shader"
+    bl_label = "Clear Overhang Shader"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == "MESH" and obj.data.materials
+
+    def execute(self, context):
+        obj = context.active_object
+        slots = obj.data.materials
+        removed = 0
+        for i in range(len(slots) - 1, -1, -1):
+            m = slots[i]
+            if m is not None and m.name.startswith(_OVERHANG_MATERIAL_NAME):
+                slots.pop(index=i)
+                removed += 1
+        _set_viewport_shading(context, "SOLID")
+
+        if removed:
+            self.report({"INFO"}, f"Removed overhang shader from {obj.name}")
+        else:
+            self.report({"INFO"}, "No overhang shader on the active mesh")
+        return {"FINISHED"}
+
+
 class CPIPE_OT_run_pipeline(bpy.types.Operator):
     """Run the pipeline: Scale -> Flatten Bottom -> Bottom Connector -> Feature Connectors"""
 
@@ -3776,6 +4017,38 @@ class CPIPE_PT_main(bpy.types.Panel):
             op_r = row.operator("cpipe.mark_side", text="Mark Right", icon="TRIA_RIGHT")
             op_r.side = "RIGHT"
 
+        # ---- Overhang Shader ----
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "overhang_shader_enabled", icon="SHADING_RENDERED")
+        if props.overhang_shader_enabled:
+            col = box.column(align=True)
+            col.prop(props, "overhang_min_angle")
+            col.prop(props, "overhang_warning_angle")
+            if props.overhang_warning_angle <= props.overhang_min_angle:
+                col.label(text="Warning ≤ min — warning ignored", icon="INFO")
+
+            col = box.column(align=True)
+            col.prop(props, "overhang_base_color")
+            col.prop(props, "overhang_warning_color")
+            col.prop(props, "overhang_unprintable_color")
+
+            box.separator()
+            row = box.row(align=True)
+            row.scale_y = 1.4
+            can_apply = obj and obj.type == "MESH"
+            row.enabled = bool(can_apply)
+            row.operator(
+                "cpipe.apply_overhang_shader",
+                text="Apply Overhang Shader",
+                icon="SHADING_RENDERED",
+            )
+            row.operator(
+                "cpipe.clear_overhang_shader",
+                text="",
+                icon="X",
+            )
+
         # ---- Export STLs ----
         box = layout.box()
         row = box.row()
@@ -3831,6 +4104,8 @@ classes = (
     CPIPE_OT_feature_select,
     CPIPE_OT_mark_side,
     CPIPE_OT_boolean,
+    CPIPE_OT_apply_overhang_shader,
+    CPIPE_OT_clear_overhang_shader,
     CPIPE_OT_run_pipeline,
     CPIPE_PT_main,
 )
