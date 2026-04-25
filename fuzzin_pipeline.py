@@ -806,7 +806,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         description="Draft angle measured from the extrusion direction",
         default=30.0,
         min=0.0,
-        max=45.0,
+        max=80.0,
         step=100,
         precision=1,
     )
