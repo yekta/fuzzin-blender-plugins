@@ -441,7 +441,7 @@ def create_tmark_cutter_bm(side="LEFT"):
 
 
 # Dot-mode dimensions (mm)
-_DOT_DIAMETER = 1.2  # circle diameter
+_DOT_DIAMETER = 1  # circle diameter
 _DOT_GAP = 0.6  # gap between perimeters of the two right-side dots
 _DOT_SEGMENTS = 48  # circle tessellation
 
