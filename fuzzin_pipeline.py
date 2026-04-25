@@ -923,6 +923,22 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ],
         default="MANIFOLD",
     )
+    connector_exact_self_intersection: BoolProperty(
+        name="Self Intersection",
+        description=(
+            "Exact solver only: allow self-intersecting feature connector "
+            "geometry during boolean operations"
+        ),
+        default=True,
+    )
+    connector_exact_hole_tolerant: BoolProperty(
+        name="Hole Tolerant",
+        description=(
+            "Exact solver only: improve feature connector booleans on meshes "
+            "with holes or non-manifold areas"
+        ),
+        default=True,
+    )
 
     # --- Boolean (clearance subtract) ---
     boolean_enabled: BoolProperty(
@@ -2443,6 +2459,8 @@ def apply_boolean_operation(
     operation="DIFFERENCE",
     report_fn=None,
     remove_operand=False,
+    exact_self_intersection=None,
+    exact_hole_tolerant=True,
 ):
     """Apply a Boolean modifier.
 
@@ -2457,10 +2475,12 @@ def apply_boolean_operation(
     bool_mod.operation = operation
     bool_mod.object = operand_obj
     bool_mod.solver = solver
-    try:
-        bool_mod.use_hole_tolerant = True
-    except AttributeError:
-        pass
+    _configure_boolean_exact_options(
+        bool_mod,
+        solver,
+        exact_self_intersection=exact_self_intersection,
+        exact_hole_tolerant=exact_hole_tolerant,
+    )
 
     success = True
     try:
@@ -2479,7 +2499,37 @@ def apply_boolean_operation(
     return success
 
 
-def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=None):
+def _configure_boolean_exact_options(
+    bool_mod,
+    solver,
+    exact_self_intersection=None,
+    exact_hole_tolerant=True,
+):
+    """Set Exact-solver Boolean options when Blender exposes them."""
+    if solver != "EXACT":
+        return
+
+    if exact_self_intersection is not None:
+        try:
+            bool_mod.use_self = exact_self_intersection
+        except AttributeError:
+            pass
+
+    try:
+        bool_mod.use_hole_tolerant = exact_hole_tolerant
+    except AttributeError:
+        pass
+
+
+def apply_boolean_difference(
+    context,
+    target_obj,
+    cutter_obj,
+    solver,
+    report_fn=None,
+    exact_self_intersection=None,
+    exact_hole_tolerant=True,
+):
     """Apply a Boolean DIFFERENCE modifier and clean up the cutter.
 
     Returns True on success, False on failure.
@@ -2492,11 +2542,19 @@ def apply_boolean_difference(context, target_obj, cutter_obj, solver, report_fn=
         operation="DIFFERENCE",
         report_fn=report_fn,
         remove_operand=True,
+        exact_self_intersection=exact_self_intersection,
+        exact_hole_tolerant=exact_hole_tolerant,
     )
 
 
 def apply_boolean_difference_with_exact_fallback(
-    context, target_obj, cutter_obj, solver, report_fn=None
+    context,
+    target_obj,
+    cutter_obj,
+    solver,
+    report_fn=None,
+    exact_self_intersection=None,
+    exact_hole_tolerant=True,
 ):
     """Apply DIFFERENCE and retry with Exact if the first solver is a no-op."""
     before = (len(target_obj.data.vertices), len(target_obj.data.polygons))
@@ -2509,6 +2567,8 @@ def apply_boolean_difference_with_exact_fallback(
         operation="DIFFERENCE",
         report_fn=report_fn,
         remove_operand=False,
+        exact_self_intersection=exact_self_intersection,
+        exact_hole_tolerant=exact_hole_tolerant,
     )
     after = (len(target_obj.data.vertices), len(target_obj.data.polygons))
 
@@ -2521,6 +2581,8 @@ def apply_boolean_difference_with_exact_fallback(
             operation="DIFFERENCE",
             report_fn=report_fn,
             remove_operand=False,
+            exact_self_intersection=exact_self_intersection,
+            exact_hole_tolerant=exact_hole_tolerant,
         )
         after = (len(target_obj.data.vertices), len(target_obj.data.polygons))
 
@@ -2884,6 +2946,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                 depth = props.connector_depth
                 clearance = props.connector_clearance
+                exact_self = props.connector_exact_self_intersection
+                exact_hole = props.connector_exact_hole_tolerant
 
                 bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -3045,6 +3109,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                                 cleanup_obj,
                                 props.connector_solver,
                                 self.report,
+                                exact_self_intersection=exact_self,
+                                exact_hole_tolerant=exact_hole,
                             )
 
                         conn_obj = bpy.data.objects.new("Connector", foot_mesh)
@@ -3108,6 +3174,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                                 operation="UNION",
                                 report_fn=self.report,
                                 remove_operand=True,
+                                exact_self_intersection=exact_self,
+                                exact_hole_tolerant=exact_hole,
                             )
                         else:
                             peg_bm.free()
@@ -3135,6 +3203,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             female_obj,
                             props.connector_solver,
                             self.report,
+                            exact_self_intersection=exact_self,
+                            exact_hole_tolerant=exact_hole,
                         )
 
                         did_straight_peg = male_ok and female_ok
@@ -3211,10 +3281,12 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     bool_mod.operation = "DIFFERENCE"
                     bool_mod.object = cutter_obj
                     bool_mod.solver = props.connector_solver
-                    try:
-                        bool_mod.use_hole_tolerant = True
-                    except AttributeError:
-                        pass
+                    _configure_boolean_exact_options(
+                        bool_mod,
+                        props.connector_solver,
+                        exact_self_intersection=exact_self,
+                        exact_hole_tolerant=exact_hole,
+                    )
 
                     try:
                         bpy.ops.object.modifier_apply(modifier=bool_mod.name)
@@ -3573,6 +3645,10 @@ class CPIPE_PT_main(bpy.types.Panel):
             sub.prop(props, "connector_smooth_iterations")
 
             col.prop(props, "connector_solver")
+            if props.connector_solver == "EXACT":
+                exact_col = col.column(align=True)
+                exact_col.prop(props, "connector_exact_self_intersection")
+                exact_col.prop(props, "connector_exact_hole_tolerant")
 
         # ---- Boolean ----
         box = layout.box()
