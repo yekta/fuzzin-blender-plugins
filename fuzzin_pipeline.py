@@ -892,6 +892,16 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=2.0,
         precision=2,
     )
+    connector_depth_clearance: BoolProperty(
+        name="Depth Clearance",
+        description=(
+            "Apply the clearance value along the extrusion axis as well, so "
+            "the cut part seats deeper into the slot. Disable to keep the "
+            "clearance as a pure perimeter (CAD-style) offset with no axial "
+            "push"
+        ),
+        default=False,
+    )
     connector_neg_dir_clearance: BoolProperty(
         name="Negative Direction Clearance",
         description=(
@@ -1863,6 +1873,7 @@ def build_solid_bmesh(
     draft_angle_rad=0.0,
     forward_clearance=0.0,
     boundary_2d_normals=None,
+    depth_clearance=True,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -2112,9 +2123,10 @@ def build_solid_bmesh(
 
         # Front-cap verts: push forward (−dir_vec) so the cutter pokes out of
         # the model surface for a clean boolean.  Perimeter verts also move
-        # outward in the plane by the clean 2D normal.
+        # outward in the plane by the clean 2D normal.  When depth_clearance
+        # is off the axial push is skipped, leaving a pure perimeter offset.
         for vi, fv in front_map.items():
-            delta = -dir_vec * clearance
+            delta = -dir_vec * clearance if depth_clearance else Vector((0, 0, 0))
             n2d = boundary_2d_normals.get(vi)
             if n2d is not None:
                 delta = delta + n2d * clearance
@@ -2124,7 +2136,7 @@ def build_solid_bmesh(
         # perimeter).  Planar direction is derived from two loop neighbours
         # on the back cap, disambiguated against the back-cap centroid.
         for v in back_vert_set:
-            delta = dir_vec * clearance
+            delta = dir_vec * clearance if depth_clearance else Vector((0, 0, 0))
             nbrs = back_adj.get(v, [])
             if len(nbrs) >= 2:
                 tang = nbrs[1].co - nbrs[0].co
@@ -3726,6 +3738,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             else 0.0
                         ),
                         boundary_2d_normals=boundary_normals,
+                        depth_clearance=props.connector_depth_clearance,
                     )
                     cutter_mesh = bpy.data.meshes.new("_Cutter")
                     cutter_bm.to_mesh(cutter_mesh)
@@ -4100,6 +4113,7 @@ class CPIPE_PT_main(bpy.types.Panel):
             extrude_col.enabled = not props.connector_straight_cut_enabled
             extrude_col.prop(props, "connector_depth")
             extrude_col.prop(props, "connector_clearance")
+            extrude_col.prop(props, "connector_depth_clearance")
             extrude_col.prop(props, "connector_neg_dir_clearance")
             sub = extrude_col.row()
             sub.enabled = props.connector_neg_dir_clearance
