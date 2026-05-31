@@ -2274,35 +2274,38 @@ def split_by_feature_faces(
 
 
 def build_straight_cut_body_cleanup_bm(
-    loop_positions, plane_no_away_from_body, offset_clearance, depth_clearance
+    loop_positions, plane_no_into_body, offset_clearance, depth_clearance
 ):
-    """Build a prism cutter that clips body overhangs past a straight-cut
-    plane.
+    """Build a prism cutter that carves a clearance pocket into the body
+    along a straight-cut plane.
 
-    The prism's front face sits on the cut plane — the loop offset
-    outward (in the plane) by *offset_clearance* — and it extrudes
-    *depth_clearance* along *plane_no_away_from_body*, which points
-    from the plane into the foot's former space. The prism therefore
-    sits above the cut plane rather than reaching into the body.
+    The prism's cross-section is the boundary loop offset outward (in
+    the plane) by *offset_clearance*. It extrudes *depth_clearance*
+    into the body along *plane_no_into_body* and pokes a small overlap
+    out the foot side so the body's cap face — coplanar with the cut
+    plane — is fully consumed by the boolean rather than left behind
+    as a coplanar artefact.
 
-    Boolean-subtracting this from the body strips any body verts that
-    overshoot the plane without carving a pocket into the body itself,
-    so the foot mates flush against the body.
+    Boolean-subtracting this from the body widens the cap by
+    *offset_clearance* and recesses it by *depth_clearance*, giving
+    the mated foot perimeter slop and pulling back any body geometry
+    that leans past the cut plane.
 
     ``loop_positions``: list of loops, each a list of Vectors on the
     cut plane (local space, already snapped).
-    ``plane_no_away_from_body``: unit Vector pointing from the plane
-    toward the foot side — i.e. past the cut, away from the body.
+    ``plane_no_into_body``: unit Vector pointing from the plane into
+    the body (opposite of the foot side).
     """
     bm = bmesh.new()
+    foot_overlap = _STRAIGHT_PEG_BOOLEAN_OVERLAP
 
     # Orthonormal basis (u, v) in the cut plane, used to resolve the
     # 2D outward direction for each loop vertex.
     ref = (
-        Vector((0, 0, 1)) if abs(plane_no_away_from_body.z) < 0.9 else Vector((1, 0, 0))
+        Vector((0, 0, 1)) if abs(plane_no_into_body.z) < 0.9 else Vector((1, 0, 0))
     )
-    u_axis = plane_no_away_from_body.cross(ref).normalized()
-    v_axis = plane_no_away_from_body.cross(u_axis).normalized()
+    u_axis = plane_no_into_body.cross(ref).normalized()
+    v_axis = plane_no_into_body.cross(u_axis).normalized()
 
     for loop in loop_positions:
         n = len(loop)
@@ -2317,8 +2320,8 @@ def build_straight_cut_body_cleanup_bm(
             prev_p = loop[(i - 1) % n]
             next_p = loop[(i + 1) % n]
             tang = next_p - prev_p
-            tang = tang - plane_no_away_from_body * plane_no_away_from_body.dot(tang)
-            nrm = plane_no_away_from_body.cross(tang)
+            tang = tang - plane_no_into_body * plane_no_into_body.dot(tang)
+            nrm = plane_no_into_body.cross(tang)
             if nrm.length < 1e-9:
                 outward.append(Vector((0, 0, 0)))
                 continue
@@ -2332,8 +2335,9 @@ def build_straight_cut_body_cleanup_bm(
         front_verts = []
         back_verts = []
         for i, p in enumerate(loop):
-            front_co = p + outward[i] * offset_clearance
-            back_co = front_co + plane_no_away_from_body * depth_clearance
+            in_plane = p + outward[i] * offset_clearance
+            front_co = in_plane - plane_no_into_body * foot_overlap
+            back_co = in_plane + plane_no_into_body * depth_clearance
             front_verts.append(bm.verts.new(front_co))
             back_verts.append(bm.verts.new(back_co))
 
@@ -3527,21 +3531,20 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                         # Body-side cleanup: boolean-subtract a shallow
                         # prism built by offsetting the boundary loop
-                        # outward and extruding it *past* the cut plane
-                        # away from the body — into the foot's former
-                        # space. The prism sits above the cut plane,
-                        # so subtracting it only removes body material
-                        # that overshoots the plane; it does not carve
-                        # into the body's interior. A cutter extending
-                        # the other way would leave a visible gap at
-                        # the interface when the foot is mated back.
-                        # local_plane_no already points toward the foot.
+                        # outward in the cut plane and extruding it
+                        # into the body. This widens the body cap by
+                        # `offset_clearance` and recesses it by
+                        # `depth_clearance`, giving the mated foot a
+                        # printable perimeter gap and pulling back any
+                        # body geometry that leans past the cut plane.
+                        # local_plane_no points toward the foot, so
+                        # negate it to get the into-body direction.
                         off_clr = props.connector_straight_offset_clearance
                         dep_clr = props.connector_straight_depth_clearance
                         if off_clr > 1e-6 or dep_clr > 1e-6:
                             cleanup_bm = build_straight_cut_body_cleanup_bm(
                                 boundary_loops_local,
-                                local_plane_no,
+                                -local_plane_no,
                                 off_clr,
                                 dep_clr,
                             )
