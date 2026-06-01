@@ -1125,6 +1125,23 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=2.0,
         precision=3,
     )
+    boolean_neg_clearance: BoolProperty(
+        name="Negative Clearance",
+        description=(
+            "Also grow the tool's back (-X) face outward in -X, continuing "
+            "the draft angle if present. Disable to keep the back face fixed "
+            "while only +X and YZ surfaces inflate"
+        ),
+        default=False,
+    )
+    boolean_neg_clearance_value: FloatProperty(
+        name="Neg Clearance (mm)",
+        description="Outward offset applied to the tool's -X surfaces in -X",
+        default=0.2,
+        min=0.0,
+        soft_max=2.0,
+        precision=3,
+    )
     boolean_solver: EnumProperty(
         name="Solver",
         description="Boolean solver for the clearance subtraction",
@@ -2618,7 +2635,7 @@ def _average_signed_distance_to_plane(obj, plane_co, plane_no):
 # ===========================================================================
 
 
-def build_yz_offset_cutter_bm(tool_obj, clearance):
+def build_yz_offset_cutter_bm(tool_obj, clearance, neg_clearance=0.0):
     """Build a bmesh that is *tool_obj* baked into world space, then expanded
     outward by *clearance* along each vertex's averaged face normal — but with
     the normal's X component clamped to be non-negative first.
@@ -2626,6 +2643,11 @@ def build_yz_offset_cutter_bm(tool_obj, clearance):
     The clamp means faces pointing in +X grow in +X, faces pointing in YZ grow
     in YZ, and faces pointing in -X don't move at all.  In practice the back
     (-X) face of the tool stays put while every other surface inflates.
+
+    When *neg_clearance* > 0 the back face is additionally pushed outward in
+    -X by that amount, scaled by each vertex's negative-X normal component so
+    angled back faces continue their draft.  Faces with no -X component are
+    unaffected.
 
     Returned bmesh is in world coordinates; the cutter object should sit at
     the origin (identity matrix_world) when used for the boolean.
@@ -2639,7 +2661,7 @@ def build_yz_offset_cutter_bm(tool_obj, clearance):
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
-    if clearance > 0.0:
+    if clearance > 0.0 or neg_clearance > 0.0:
         for f in bm.faces:
             f.normal_update()
         for v in bm.verts:
@@ -2648,11 +2670,20 @@ def build_yz_offset_cutter_bm(tool_obj, clearance):
             avg_normal = Vector((0, 0, 0))
             for f in v.link_faces:
                 avg_normal += f.normal
-            if avg_normal.x < 0.0:
-                avg_normal.x = 0.0
-            if avg_normal.length > 0:
-                avg_normal.normalize()
-                v.co += avg_normal * clearance
+            neg_x = avg_normal.x  # original -X component, before clamping
+
+            if clearance > 0.0:
+                pos_normal = avg_normal.copy()
+                if pos_normal.x < 0.0:
+                    pos_normal.x = 0.0
+                if pos_normal.length > 0:
+                    v.co += pos_normal.normalized() * clearance
+
+            if neg_clearance > 0.0 and neg_x < 0.0 and avg_normal.length > 0:
+                # Continue the draft: displace in -X scaled by how much the
+                # averaged normal points backward.
+                back_fraction = -neg_x / avg_normal.length
+                v.co.x -= neg_clearance * back_fraction
 
     return bm
 
@@ -2880,7 +2911,7 @@ def apply_boolean_difference_with_exact_fallback(
 
 
 def perform_boolean_subtract(
-    context, tool_obj, target_obj, clearance, solver, report_fn=None
+    context, tool_obj, target_obj, clearance, solver, report_fn=None, neg_clearance=0.0
 ):
     """Subtract a YZ-plane offset of *tool_obj* from *target_obj*.
 
@@ -2893,7 +2924,7 @@ def perform_boolean_subtract(
         context.view_layer.objects.active = target_obj
         bpy.ops.object.mode_set(mode="OBJECT")
 
-    cutter_bm = build_yz_offset_cutter_bm(tool_obj, clearance)
+    cutter_bm = build_yz_offset_cutter_bm(tool_obj, clearance, neg_clearance)
     cutter_mesh = bpy.data.meshes.new("_BooleanCutter")
     cutter_bm.to_mesh(cutter_mesh)
     cutter_bm.free()
@@ -2936,6 +2967,9 @@ class CPIPE_OT_boolean(bpy.types.Operator):
             self.report({"WARNING"}, "Tool and target must be mesh objects")
             return {"CANCELLED"}
 
+        neg_clearance = (
+            props.boolean_neg_clearance_value if props.boolean_neg_clearance else 0.0
+        )
         ok = perform_boolean_subtract(
             context,
             tool,
@@ -2943,14 +2977,16 @@ class CPIPE_OT_boolean(bpy.types.Operator):
             props.boolean_clearance,
             props.boolean_solver,
             self.report,
+            neg_clearance=neg_clearance,
         )
         if not ok:
             self.report({"WARNING"}, "Boolean failed. Try a different solver.")
             return {"CANCELLED"}
 
+        neg_msg = f" +{neg_clearance:.3f} mm neg-X" if neg_clearance > 0.0 else ""
         self.report(
             {"INFO"},
-            f"Subtracted {tool.name} (offset {props.boolean_clearance:.3f} mm) from {target.name}",
+            f"Subtracted {tool.name} (offset {props.boolean_clearance:.3f} mm{neg_msg}) from {target.name}",
         )
         return {"FINISHED"}
 
@@ -3819,6 +3855,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 props.boolean_clearance,
                 props.boolean_solver,
                 self.report,
+                neg_clearance=(
+                    props.boolean_neg_clearance_value
+                    if props.boolean_neg_clearance
+                    else 0.0
+                ),
             )
             if ok:
                 did_boolean = True
@@ -3901,9 +3942,14 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     f"{draft_str}"
                 )
         if did_boolean:
+            bool_neg_str = (
+                f" +{props.boolean_neg_clearance_value:.3f} mm neg-X"
+                if props.boolean_neg_clearance
+                else ""
+            )
             parts.append(
-                f"Boolean: {props.boolean_tool.name} - {props.boolean_clearance:.3f} mm "
-                f"-> {props.boolean_target.name}"
+                f"Boolean: {props.boolean_tool.name} - {props.boolean_clearance:.3f} mm"
+                f"{bool_neg_str} -> {props.boolean_target.name}"
             )
 
         # ================================================================
@@ -4151,6 +4197,10 @@ class CPIPE_PT_main(bpy.types.Panel):
             ):
                 box.label(text="Tool and target must differ", icon="ERROR")
             box.prop(props, "boolean_clearance")
+            box.prop(props, "boolean_neg_clearance")
+            sub = box.row()
+            sub.enabled = props.boolean_neg_clearance
+            sub.prop(props, "boolean_neg_clearance_value")
             box.prop(props, "boolean_solver")
 
         # ---- Mark Left / Right ----
