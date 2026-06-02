@@ -912,6 +912,18 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         ],
         default="BODY",
     )
+    connector_cutter_relief_percent: FloatProperty(
+        name="Cutter Relief (%)",
+        description=(
+            "Extra body-cutter overcut as a percentage of the feature footprint. "
+            "Use this to prevent coplanar z-fighting residue; applies to both "
+            "Body and Part clearance sides"
+        ),
+        default=0.1,
+        min=0.0,
+        soft_max=1.0,
+        precision=3,
+    )
     connector_depth_clearance: BoolProperty(
         name="Depth Clearance",
         description=(
@@ -1786,6 +1798,33 @@ def _planar_basis(dir_vec):
     return u_axis, v_axis
 
 
+def _feature_cutter_relief(selected_verts_set, vert_coords, dir_vec, relief_percent):
+    """Return body-cutter relief from a percentage of the feature footprint.
+
+    A strictly nominal body cut can leave coplanar boolean residue where
+    surfaces touch exactly. This relief makes the cutter slightly larger than
+    the nominal shape without tying that cleanup amount to the fit clearance.
+    """
+    if relief_percent <= 1e-9 or not selected_verts_set:
+        return 0.0
+
+    u_axis, v_axis = _planar_basis(dir_vec)
+    coords = [
+        (u_axis.dot(vert_coords[vi]), v_axis.dot(vert_coords[vi]))
+        for vi in selected_verts_set
+    ]
+    if not coords:
+        return 0.0
+
+    min_u = min(c[0] for c in coords)
+    max_u = max(c[0] for c in coords)
+    min_v = min(c[1] for c in coords)
+    max_v = max(c[1] for c in coords)
+    planar_diag = math.sqrt((max_u - min_u) ** 2 + (max_v - min_v) ** 2)
+
+    return planar_diag * relief_percent * 0.01
+
+
 def build_boundary_loops(edge_face_count):
     """Given ``edge_face_count`` (keys: sorted ``(vi1, vi2)`` tuples, values:
     list of face indices touching that edge), walk every edge that belongs to
@@ -1912,6 +1951,7 @@ def build_solid_bmesh(
     boundary_2d_normals=None,
     depth_clearance=True,
     clearance_mode="OUTSET",
+    axial_clearance_amount=None,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -2119,9 +2159,23 @@ def build_solid_bmesh(
     if clearance > 0.0:
         inset_clearance = clearance_mode == "INSET"
         planar_sign = -1.0 if inset_clearance else 1.0
-        axial_clearance = clearance
-        if inset_clearance and depth_clearance:
-            axial_clearance = min(clearance, max(depth * 0.5 - 1e-5, 0.0))
+        if axial_clearance_amount is None:
+            axial_clearance = clearance if depth_clearance else 0.0
+        else:
+            axial_clearance = max(axial_clearance_amount, 0.0)
+        if inset_clearance:
+            axial_clearance = min(axial_clearance, max(depth * 0.5 - 1e-5, 0.0))
+
+        def inset_delta(co, center):
+            radial = co - center
+            radial = radial - dir_vec * dir_vec.dot(radial)
+            dist = radial.length
+            if dist < 1e-6:
+                return Vector((0, 0, 0))
+            move = min(clearance, max(dist - 1e-5, 0.0))
+            if move <= 0.0:
+                return Vector((0, 0, 0))
+            return -radial.normalized() * move
 
         bm.faces.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
@@ -2152,8 +2206,20 @@ def build_solid_bmesh(
         if back_vert_set:
             back_cu = sum(u_axis.dot(v.co) for v in back_vert_set) / len(back_vert_set)
             back_cv = sum(v_axis.dot(v.co) for v in back_vert_set) / len(back_vert_set)
+            back_center = sum((v.co for v in back_vert_set), Vector((0, 0, 0))) / len(
+                back_vert_set
+            )
         else:
             back_cu = back_cv = 0.0
+            back_center = Vector((0, 0, 0))
+
+        if selected_verts_set:
+            front_center = sum(
+                (front_map[vi].co for vi in selected_verts_set),
+                Vector((0, 0, 0)),
+            ) / len(selected_verts_set)
+        else:
+            front_center = Vector((0, 0, 0))
 
         # Adjacency along the back loop (only edges that stay on cut_proj).
         back_adj = {v: [] for v in back_vert_set}
@@ -2172,12 +2238,15 @@ def build_solid_bmesh(
         for vi, fv in front_map.items():
             delta = (
                 dir_vec * (axial_clearance if inset_clearance else -axial_clearance)
-                if depth_clearance
+                if axial_clearance > 0.0
                 else Vector((0, 0, 0))
             )
-            n2d = boundary_2d_normals.get(vi)
-            if n2d is not None:
-                delta = delta + n2d * clearance * planar_sign
+            if inset_clearance:
+                delta = delta + inset_delta(fv.co, front_center)
+            else:
+                n2d = boundary_2d_normals.get(vi)
+                if n2d is not None:
+                    delta = delta + n2d * clearance * planar_sign
             new_positions[fv] = fv.co + delta
 
         # Back-cap verts: BODY mode grows deeper and outward. PART mode moves
@@ -2185,25 +2254,37 @@ def build_solid_bmesh(
         for v in back_vert_set:
             delta = (
                 dir_vec * (-axial_clearance if inset_clearance else axial_clearance)
-                if depth_clearance
+                if axial_clearance > 0.0
                 else Vector((0, 0, 0))
             )
-            nbrs = back_adj.get(v, [])
-            if len(nbrs) >= 2:
-                tang = nbrs[1].co - nbrs[0].co
-                tang = tang - dir_vec * dir_vec.dot(tang)
-                nrm3d = dir_vec.cross(tang)
-                if nrm3d.length > 1e-9:
-                    nrm3d.normalize()
-                    off_u = u_axis.dot(v.co) - back_cu
-                    off_v = v_axis.dot(v.co) - back_cv
-                    if u_axis.dot(nrm3d) * off_u + v_axis.dot(nrm3d) * off_v < 0:
-                        nrm3d = -nrm3d
-                    delta = delta + nrm3d * clearance * planar_sign
+            if inset_clearance:
+                delta = delta + inset_delta(v.co, back_center)
+            else:
+                nbrs = back_adj.get(v, [])
+                if len(nbrs) >= 2:
+                    tang = nbrs[1].co - nbrs[0].co
+                    tang = tang - dir_vec * dir_vec.dot(tang)
+                    nrm3d = dir_vec.cross(tang)
+                    if nrm3d.length > 1e-9:
+                        nrm3d.normalize()
+                        off_u = u_axis.dot(v.co) - back_cu
+                        off_v = v_axis.dot(v.co) - back_cv
+                        if u_axis.dot(nrm3d) * off_u + v_axis.dot(nrm3d) * off_v < 0:
+                            nrm3d = -nrm3d
+                        delta = delta + nrm3d * clearance * planar_sign
             new_positions[v] = v.co + delta
 
         for v, new_co in new_positions.items():
             v.co = new_co
+
+        if inset_clearance:
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            if bm.edges:
+                bmesh.ops.dissolve_degenerate(bm, edges=bm.edges[:], dist=1e-6)
+            if bm.verts:
+                bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=1e-6)
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
     return bm
 
@@ -3473,6 +3554,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 clearance = props.connector_clearance
                 clearance_side = props.connector_clearance_side
                 clearance_on_part = clearance_side == "PART"
+                cutter_relief = 0.0
                 exact_self = props.connector_exact_self_intersection
                 exact_hole = props.connector_exact_hole_tolerant
 
@@ -3779,6 +3861,18 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     boundary_normals = boundary_2d_outward_normals(
                         boundary_loops, vert_coords, dir_vec
                     )
+                    cutter_relief = _feature_cutter_relief(
+                        selected_verts_set,
+                        vert_coords,
+                        dir_vec,
+                        props.connector_cutter_relief_percent,
+                    )
+                    cutter_clearance = (
+                        cutter_relief if clearance_on_part else clearance + cutter_relief
+                    )
+                    cutter_axial_clearance = cutter_relief
+                    if not clearance_on_part and props.connector_depth_clearance:
+                        cutter_axial_clearance += clearance
 
                     conn_bm = build_solid_bmesh(
                         face_vert_lists,
@@ -3807,7 +3901,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         selected_verts_set,
                         edge_face_count,
                         depth,
-                        clearance=0.0 if clearance_on_part else clearance,
+                        clearance=cutter_clearance,
                         direction=direction,
                         draft_angle_rad=draft_rad,
                         forward_clearance=(
@@ -3816,8 +3910,9 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             else 0.0
                         ),
                         boundary_2d_normals=boundary_normals,
-                        depth_clearance=props.connector_depth_clearance,
+                        depth_clearance=True,
                         clearance_mode="OUTSET",
+                        axial_clearance_amount=cutter_axial_clearance,
                     )
                     cutter_mesh = bpy.data.meshes.new("_Cutter")
                     cutter_bm.to_mesh(cutter_mesh)
@@ -3980,11 +4075,17 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                     if props.connector_clearance_side == "PART"
                     else "body-side"
                 )
+                relief_str = (
+                    f", {props.connector_cutter_relief_percent:.3f}% cutter relief"
+                    if props.connector_cutter_relief_percent > 1e-6
+                    else ""
+                )
                 parts.append(
                     f"Feature connector: {props.connector_depth:.1f} mm depth "
                     f"({props.connector_direction}), "
                     f"{props.connector_clearance:.2f} mm {clearance_side_str} clearance"
                     f"{neg_dir_str}"
+                    f"{relief_str}"
                     f"{draft_str}"
                 )
         if did_boolean:
@@ -4209,6 +4310,7 @@ class CPIPE_PT_main(bpy.types.Panel):
             extrude_col.prop(props, "connector_depth")
             extrude_col.prop(props, "connector_clearance")
             extrude_col.prop(props, "connector_clearance_side")
+            extrude_col.prop(props, "connector_cutter_relief_percent")
             extrude_col.prop(props, "connector_depth_clearance")
             body_clearance_col = extrude_col.column(align=True)
             body_clearance_col.enabled = props.connector_clearance_side == "BODY"
