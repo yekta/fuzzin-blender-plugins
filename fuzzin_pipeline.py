@@ -892,13 +892,33 @@ class CPIPE_Props(bpy.types.PropertyGroup):
         soft_max=2.0,
         precision=2,
     )
+    connector_clearance_side: EnumProperty(
+        name="Clearance Side",
+        description=(
+            "Choose whether feature connector clearance is removed from the "
+            "body-side socket or from the separated connector part"
+        ),
+        items=[
+            (
+                "BODY",
+                "Body",
+                "Current behavior: enlarge the body-side socket by the clearance",
+            ),
+            (
+                "PART",
+                "Part",
+                "Shrink the separated connector part by the clearance instead",
+            ),
+        ],
+        default="BODY",
+    )
     connector_depth_clearance: BoolProperty(
         name="Depth Clearance",
         description=(
             "Apply the clearance value along the extrusion axis as well, so "
-            "the cut part seats deeper into the slot. Disable to keep the "
-            "clearance as a pure perimeter (CAD-style) offset with no axial "
-            "push"
+            "body-side clearance makes the slot deeper and part-side clearance "
+            "shortens the connector. Disable to keep the clearance as a pure "
+            "perimeter (CAD-style) offset with no axial push"
         ),
         default=False,
     )
@@ -1891,6 +1911,7 @@ def build_solid_bmesh(
     forward_clearance=0.0,
     boundary_2d_normals=None,
     depth_clearance=True,
+    clearance_mode="OUTSET",
 ):
     dir_vec = _parse_direction(direction)
 
@@ -2096,6 +2117,12 @@ def build_solid_bmesh(
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
     if clearance > 0.0:
+        inset_clearance = clearance_mode == "INSET"
+        planar_sign = -1.0 if inset_clearance else 1.0
+        axial_clearance = clearance
+        if inset_clearance and depth_clearance:
+            axial_clearance = min(clearance, max(depth * 0.5 - 1e-5, 0.0))
+
         bm.faces.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
@@ -2138,22 +2165,29 @@ def build_solid_bmesh(
 
         new_positions = {}
 
-        # Front-cap verts: push forward (−dir_vec) so the cutter pokes out of
-        # the model surface for a clean boolean.  Perimeter verts also move
-        # outward in the plane by the clean 2D normal.  When depth_clearance
-        # is off the axial push is skipped, leaving a pure perimeter offset.
+        # Front-cap verts: BODY mode pushes forward (-dir_vec) so the cutter
+        # pokes out of the model surface for a clean boolean. PART mode insets
+        # the generated connector, so the axial direction is reversed and the
+        # perimeter moves toward the loop interior.
         for vi, fv in front_map.items():
-            delta = -dir_vec * clearance if depth_clearance else Vector((0, 0, 0))
+            delta = (
+                dir_vec * (axial_clearance if inset_clearance else -axial_clearance)
+                if depth_clearance
+                else Vector((0, 0, 0))
+            )
             n2d = boundary_2d_normals.get(vi)
             if n2d is not None:
-                delta = delta + n2d * clearance
+                delta = delta + n2d * clearance * planar_sign
             new_positions[fv] = fv.co + delta
 
-        # Back-cap verts: deeper axially and outward planar (all are on the
-        # perimeter).  Planar direction is derived from two loop neighbours
-        # on the back cap, disambiguated against the back-cap centroid.
+        # Back-cap verts: BODY mode grows deeper and outward. PART mode moves
+        # the back cap toward the front and insets the perimeter.
         for v in back_vert_set:
-            delta = dir_vec * clearance if depth_clearance else Vector((0, 0, 0))
+            delta = (
+                dir_vec * (-axial_clearance if inset_clearance else axial_clearance)
+                if depth_clearance
+                else Vector((0, 0, 0))
+            )
             nbrs = back_adj.get(v, [])
             if len(nbrs) >= 2:
                 tang = nbrs[1].co - nbrs[0].co
@@ -2165,7 +2199,7 @@ def build_solid_bmesh(
                     off_v = v_axis.dot(v.co) - back_cv
                     if u_axis.dot(nrm3d) * off_u + v_axis.dot(nrm3d) * off_v < 0:
                         nrm3d = -nrm3d
-                    delta = delta + nrm3d * clearance
+                    delta = delta + nrm3d * clearance * planar_sign
             new_positions[v] = v.co + delta
 
         for v, new_co in new_positions.items():
@@ -3437,6 +3471,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
 
                 depth = props.connector_depth
                 clearance = props.connector_clearance
+                clearance_side = props.connector_clearance_side
+                clearance_on_part = clearance_side == "PART"
                 exact_self = props.connector_exact_self_intersection
                 exact_hole = props.connector_exact_hole_tolerant
 
@@ -3750,9 +3786,12 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         selected_verts_set,
                         edge_face_count,
                         depth,
+                        clearance=clearance if clearance_on_part else 0.0,
                         direction=direction,
                         draft_angle_rad=draft_rad,
                         boundary_2d_normals=boundary_normals,
+                        depth_clearance=props.connector_depth_clearance,
+                        clearance_mode="INSET",
                     )
                     conn_mesh = bpy.data.meshes.new("Connector")
                     conn_bm.to_mesh(conn_mesh)
@@ -3768,16 +3807,17 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         selected_verts_set,
                         edge_face_count,
                         depth,
-                        clearance=clearance,
+                        clearance=0.0 if clearance_on_part else clearance,
                         direction=direction,
                         draft_angle_rad=draft_rad,
                         forward_clearance=(
                             props.connector_neg_dir_clearance_value
-                            if props.connector_neg_dir_clearance
+                            if props.connector_neg_dir_clearance and not clearance_on_part
                             else 0.0
                         ),
                         boundary_2d_normals=boundary_normals,
                         depth_clearance=props.connector_depth_clearance,
+                        clearance_mode="OUTSET",
                     )
                     cutter_mesh = bpy.data.meshes.new("_Cutter")
                     cutter_bm.to_mesh(cutter_mesh)
@@ -3932,12 +3972,18 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 neg_dir_str = (
                     f" +{props.connector_neg_dir_clearance_value:.2f} mm neg-dir"
                     if props.connector_neg_dir_clearance
+                    and props.connector_clearance_side == "BODY"
                     else ""
+                )
+                clearance_side_str = (
+                    "part-side"
+                    if props.connector_clearance_side == "PART"
+                    else "body-side"
                 )
                 parts.append(
                     f"Feature connector: {props.connector_depth:.1f} mm depth "
                     f"({props.connector_direction}), "
-                    f"{props.connector_clearance:.2f} mm clearance"
+                    f"{props.connector_clearance:.2f} mm {clearance_side_str} clearance"
                     f"{neg_dir_str}"
                     f"{draft_str}"
                 )
@@ -4162,9 +4208,12 @@ class CPIPE_PT_main(bpy.types.Panel):
             extrude_col.enabled = not props.connector_straight_cut_enabled
             extrude_col.prop(props, "connector_depth")
             extrude_col.prop(props, "connector_clearance")
+            extrude_col.prop(props, "connector_clearance_side")
             extrude_col.prop(props, "connector_depth_clearance")
-            extrude_col.prop(props, "connector_neg_dir_clearance")
-            sub = extrude_col.row()
+            body_clearance_col = extrude_col.column(align=True)
+            body_clearance_col.enabled = props.connector_clearance_side == "BODY"
+            body_clearance_col.prop(props, "connector_neg_dir_clearance")
+            sub = body_clearance_col.row()
             sub.enabled = props.connector_neg_dir_clearance
             sub.prop(props, "connector_neg_dir_clearance_value")
             extrude_col.prop(props, "connector_draft_enabled")
