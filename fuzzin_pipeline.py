@@ -886,7 +886,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_clearance: FloatProperty(
         name="Clearance",
         description="Extra offset for the slot for 3D printing tolerance (in scene units)",
-        default=0.2,
+        default=0.15,
         min=0.0,
         soft_max=2.0,
         precision=2,
@@ -944,7 +944,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_neg_dir_clearance_value: FloatProperty(
         name="Neg Dir Clearance",
         description="Amount to extend the cutter opposite the extrusion direction",
-        default=0.2,
+        default=0.15,
         min=0.0,
         soft_max=2.0,
         precision=2,
@@ -1033,7 +1033,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             "measured into the body from the cut plane. Pulls back any body "
             "geometry that leans into the plane so the mated foot sits flush"
         ),
-        default=0.2,
+        default=0.15,
         min=0.0,
         soft_max=2.0,
         precision=2,
@@ -1151,7 +1151,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     boolean_clearance: FloatProperty(
         name="Clearance (mm)",
         description="Outward offset applied to the tool before subtraction",
-        default=0.2,
+        default=0.15,
         min=0.0,
         soft_max=2.0,
         precision=3,
@@ -1168,7 +1168,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     boolean_neg_clearance_value: FloatProperty(
         name="Neg Clearance (mm)",
         description="Outward offset applied to the tool's -X surfaces in -X",
-        default=0.2,
+        default=0.15,
         min=0.0,
         soft_max=2.0,
         precision=3,
