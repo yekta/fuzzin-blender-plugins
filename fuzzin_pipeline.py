@@ -22,7 +22,6 @@ from bpy.props import (
     IntProperty,
 )
 
-
 # ===========================================================================
 # Shared BFS Flood Fill
 # ===========================================================================
@@ -919,7 +918,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
             "Use this to prevent coplanar z-fighting residue; applies to both "
             "Body and Part clearance sides"
         ),
-        default=0.1,
+        default=1,
         min=0.0,
         soft_max=1.0,
         precision=3,
@@ -981,7 +980,7 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_smooth_iterations: IntProperty(
         name="Smoothing Iterations",
         description="Number of Laplacian smoothing passes on the boundary loop",
-        default=8,
+        default=4,
         min=1,
         max=50,
     )
@@ -2433,9 +2432,7 @@ def build_straight_cut_body_cleanup_bm(
 
     # Orthonormal basis (u, v) in the cut plane, used to resolve the
     # 2D outward direction for each loop vertex.
-    ref = (
-        Vector((0, 0, 1)) if abs(plane_no_into_body.z) < 0.9 else Vector((1, 0, 0))
-    )
+    ref = Vector((0, 0, 1)) if abs(plane_no_into_body.z) < 0.9 else Vector((1, 0, 0))
     u_axis = plane_no_into_body.cross(ref).normalized()
     v_axis = plane_no_into_body.cross(u_axis).normalized()
 
@@ -3868,7 +3865,9 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         props.connector_cutter_relief_percent,
                     )
                     cutter_clearance = (
-                        cutter_relief if clearance_on_part else clearance + cutter_relief
+                        cutter_relief
+                        if clearance_on_part
+                        else clearance + cutter_relief
                     )
                     cutter_axial_clearance = cutter_relief
                     if not clearance_on_part and props.connector_depth_clearance:
@@ -3906,7 +3905,8 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         draft_angle_rad=draft_rad,
                         forward_clearance=(
                             props.connector_neg_dir_clearance_value
-                            if props.connector_neg_dir_clearance and not clearance_on_part
+                            if props.connector_neg_dir_clearance
+                            and not clearance_on_part
                             else 0.0
                         ),
                         boundary_2d_normals=boundary_normals,
