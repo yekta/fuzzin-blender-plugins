@@ -914,11 +914,11 @@ class CPIPE_Props(bpy.types.PropertyGroup):
     connector_cutter_relief_percent: FloatProperty(
         name="Cutter Relief (%)",
         description=(
-            "Extra body-cutter overcut as a percentage of the feature footprint. "
-            "Use this to prevent coplanar z-fighting residue; applies to both "
-            "Body and Part clearance sides"
+            "Extra lateral body-cutter overcut as a percentage of the feature "
+            "footprint. Fit depth stays nominal unless Depth Clearance is enabled; "
+            "coplanar boolean cleanup uses a hidden overlap"
         ),
-        default=1,
+        default=0.1,
         min=0.0,
         soft_max=1.0,
         precision=3,
@@ -1760,6 +1760,8 @@ class CPIPE_OT_mark_side(bpy.types.Operator):
 # Build Solid Helper (for Feature Connectors)
 # ===========================================================================
 
+_FEATURE_CONNECTOR_BOOLEAN_OVERLAP = 0.02  # mm, hidden overlap for coplanar booleans
+
 
 def _parse_direction(direction):
     """Return a normalised direction Vector for a direction enum value."""
@@ -1936,6 +1938,153 @@ def boundary_2d_outward_normals(loops, vert_coords, dir_vec):
     return normals
 
 
+def _line_intersection_2d(p1, d1, p2, d2):
+    cross = d1.x * d2.y - d1.y * d2.x
+    if abs(cross) < 1e-9:
+        return None
+    delta = p2 - p1
+    t = (delta.x * d2.y - delta.y * d2.x) / cross
+    return p1 + d1 * t
+
+
+def _offset_loop_positions_2d(loop, vert_coords, u_axis, v_axis, offset):
+    """Return a mitered 2D parallel offset for one boundary loop.
+
+    This is the CAD-style operation the feature connector needs: offset the
+    loop's edges, then intersect neighbouring offset edges to place each new
+    corner.  It is deliberately independent from depth/extrusion clearance.
+    """
+    n = len(loop)
+    if n < 3 or abs(offset) <= 1e-9:
+        return {}
+
+    pts = [
+        Vector((u_axis.dot(vert_coords[vi]), v_axis.dot(vert_coords[vi])))
+        for vi in loop
+    ]
+
+    area2 = 0.0
+    for i in range(n):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % n]
+        area2 += p0.x * p1.y - p1.x * p0.y
+
+    if abs(area2) < 1e-12:
+        return {}
+
+    lines = []
+    for i in range(n):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % n]
+        tangent = p1 - p0
+        if tangent.length < 1e-9:
+            lines.append(None)
+            continue
+        tangent.normalize()
+        if area2 > 0.0:
+            outward = Vector((tangent.y, -tangent.x))
+        else:
+            outward = Vector((-tangent.y, tangent.x))
+        lines.append((p0 + outward * offset, tangent, outward))
+
+    result = {}
+    max_miter = max(abs(offset) * 20.0, abs(offset) + 1.0e-4)
+    for i, vi in enumerate(loop):
+        prev_line = lines[(i - 1) % n]
+        next_line = lines[i]
+        base = pts[i]
+
+        candidate = None
+        if prev_line is not None and next_line is not None:
+            candidate = _line_intersection_2d(
+                prev_line[0], prev_line[1], next_line[0], next_line[1]
+            )
+
+        if (
+            candidate is None
+            or not math.isfinite(candidate.x)
+            or not math.isfinite(candidate.y)
+            or (candidate - base).length > max_miter
+        ):
+            normals = []
+            if prev_line is not None:
+                normals.append(prev_line[2])
+            if next_line is not None:
+                normals.append(next_line[2])
+            avg = Vector((0.0, 0.0))
+            for normal in normals:
+                avg += normal
+            if avg.length < 1e-9:
+                candidate = base
+            else:
+                avg.normalize()
+                candidate = base + avg * offset
+
+        result[vi] = candidate
+
+    return result
+
+
+def cad_offset_boundary_positions(
+    loops,
+    vert_coords,
+    dir_vec,
+    offset,
+    envelope_vert_coords=None,
+):
+    """Return local-space boundary positions after a true 2D loop offset.
+
+    ``offset`` is measured only in the plane perpendicular to ``dir_vec``.
+    ``envelope_vert_coords`` can be supplied when the displayed connector loop
+    has been smoothed but the body cutter must still consume the original
+    jagged boundary.
+    """
+    if abs(offset) <= 1e-9:
+        return {}
+
+    u_axis, v_axis = _planar_basis(dir_vec)
+    positions = {}
+
+    for loop in loops:
+        offset_2d = _offset_loop_positions_2d(loop, vert_coords, u_axis, v_axis, offset)
+        if not offset_2d:
+            continue
+
+        envelope_2d = None
+        if envelope_vert_coords is not None:
+            envelope_2d = _offset_loop_positions_2d(
+                loop, envelope_vert_coords, u_axis, v_axis, offset
+            )
+
+        center = Vector((0.0, 0.0))
+        for vi in loop:
+            center += Vector((u_axis.dot(vert_coords[vi]), v_axis.dot(vert_coords[vi])))
+        center /= len(loop)
+
+        for vi in loop:
+            chosen = offset_2d[vi]
+            if envelope_2d is not None and vi in envelope_2d and offset > 0.0:
+                envelope_candidate = envelope_2d[vi]
+                base = Vector(
+                    (u_axis.dot(vert_coords[vi]), v_axis.dot(vert_coords[vi]))
+                )
+                outward = chosen - base
+                use_envelope = (envelope_candidate - center).length > (
+                    chosen - center
+                ).length
+                if outward.length > 1e-9:
+                    use_envelope = use_envelope or (
+                        outward.normalized().dot(envelope_candidate - chosen) > 0.0
+                    )
+                if use_envelope:
+                    chosen = envelope_candidate
+
+            axial = dir_vec.dot(vert_coords[vi])
+            positions[vi] = u_axis * chosen.x + v_axis * chosen.y + dir_vec * axial
+
+    return positions
+
+
 def build_solid_bmesh(
     face_vert_lists,
     vert_coords,
@@ -1948,9 +2097,11 @@ def build_solid_bmesh(
     draft_angle_rad=0.0,
     forward_clearance=0.0,
     boundary_2d_normals=None,
+    boundary_offset_positions=None,
     depth_clearance=True,
     clearance_mode="OUTSET",
     axial_clearance_amount=None,
+    front_overlap=0.0,
 ):
     dir_vec = _parse_direction(direction)
 
@@ -1964,8 +2115,9 @@ def build_solid_bmesh(
 
     # Negative direction clearance: shift the front face opposite the extrusion
     # direction and, when drafted, widen it so the wall slope continues.
+    forward_total = max(forward_clearance, 0.0) + max(front_overlap, 0.0)
     forward_shift = (
-        -dir_vec * forward_clearance if forward_clearance > 1e-6 else Vector((0, 0, 0))
+        -dir_vec * forward_total if forward_total > 1e-6 else Vector((0, 0, 0))
     )
     forward_expand = (
         forward_clearance * math.tan(draft_angle_rad)
@@ -2240,13 +2392,31 @@ def build_solid_bmesh(
                 if axial_clearance > 0.0
                 else Vector((0, 0, 0))
             )
-            if inset_clearance:
+            offset_pos = (
+                boundary_offset_positions.get(vi)
+                if boundary_offset_positions is not None
+                else None
+            )
+            if offset_pos is not None:
+                planar_delta = offset_pos - vert_coords[vi]
+                planar_delta = planar_delta - dir_vec * dir_vec.dot(planar_delta)
+                delta = delta + planar_delta
+            elif inset_clearance:
                 delta = delta + inset_delta(fv.co, front_center)
             else:
                 n2d = boundary_2d_normals.get(vi)
                 if n2d is not None:
                     delta = delta + n2d * clearance * planar_sign
             new_positions[fv] = fv.co + delta
+
+        back_vert_to_vi = {}
+        if boundary_offset_positions is not None:
+            for v in back_vert_set:
+                for e in v.link_edges:
+                    vi = front_vert_to_vi.get(e.other_vert(v))
+                    if vi is not None:
+                        back_vert_to_vi[v] = vi
+                        break
 
         # Back-cap verts: BODY mode grows deeper and outward. PART mode moves
         # the back cap toward the front and insets the perimeter.
@@ -2256,7 +2426,15 @@ def build_solid_bmesh(
                 if axial_clearance > 0.0
                 else Vector((0, 0, 0))
             )
-            if inset_clearance:
+            offset_pos = None
+            vi = back_vert_to_vi.get(v)
+            if vi is not None:
+                offset_pos = boundary_offset_positions.get(vi)
+            if offset_pos is not None:
+                planar_delta = offset_pos - vert_coords[vi]
+                planar_delta = planar_delta - dir_vec * dir_vec.dot(planar_delta)
+                delta = delta + planar_delta
+            elif inset_clearance:
                 delta = delta + inset_delta(v.co, back_center)
             else:
                 nbrs = back_adj.get(v, [])
@@ -3546,6 +3724,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                 vert_coords = {}
                 for vi in selected_verts_set:
                     vert_coords[vi] = bm.verts[vi].co.copy()
+                original_vert_coords = {vi: co.copy() for vi, co in vert_coords.items()}
 
                 depth = props.connector_depth
                 clearance = props.connector_clearance
@@ -3869,9 +4048,26 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         if clearance_on_part
                         else clearance + cutter_relief
                     )
-                    cutter_axial_clearance = cutter_relief
+                    cutter_axial_clearance = 0.0
                     if not clearance_on_part and props.connector_depth_clearance:
                         cutter_axial_clearance += clearance
+                    conn_boundary_offsets = None
+                    if clearance_on_part and clearance > 1e-9:
+                        conn_boundary_offsets = cad_offset_boundary_positions(
+                            boundary_loops,
+                            vert_coords,
+                            dir_vec,
+                            -clearance,
+                        )
+                    cutter_boundary_offsets = None
+                    if cutter_clearance > 1e-9:
+                        cutter_boundary_offsets = cad_offset_boundary_positions(
+                            boundary_loops,
+                            vert_coords,
+                            dir_vec,
+                            cutter_clearance,
+                            envelope_vert_coords=original_vert_coords,
+                        )
 
                     conn_bm = build_solid_bmesh(
                         face_vert_lists,
@@ -3883,6 +4079,7 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                         direction=direction,
                         draft_angle_rad=draft_rad,
                         boundary_2d_normals=boundary_normals,
+                        boundary_offset_positions=conn_boundary_offsets,
                         depth_clearance=props.connector_depth_clearance,
                         clearance_mode="INSET",
                     )
@@ -3910,9 +4107,11 @@ class CPIPE_OT_run_pipeline(bpy.types.Operator):
                             else 0.0
                         ),
                         boundary_2d_normals=boundary_normals,
+                        boundary_offset_positions=cutter_boundary_offsets,
                         depth_clearance=True,
                         clearance_mode="OUTSET",
                         axial_clearance_amount=cutter_axial_clearance,
+                        front_overlap=_FEATURE_CONNECTOR_BOOLEAN_OVERLAP,
                     )
                     cutter_mesh = bpy.data.meshes.new("_Cutter")
                     cutter_bm.to_mesh(cutter_mesh)
